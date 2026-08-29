@@ -22,6 +22,32 @@ import time
 import cv2
 import zmq
 
+try:
+    import smbus2 as _smbus2
+    _imu_bus = _smbus2.SMBus(7)
+    _imu_bus.write_byte_data(0x68, 0x6B, 0)
+    IMU_OK = True
+except Exception:
+    IMU_OK = False
+
+def _read_imu():
+    if not IMU_OK:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    try:
+        d = _imu_bus.read_i2c_block_data(0x68, 0x3B, 14)
+        def s16(hi, lo):
+            v = (hi << 8) | lo
+            return (v - 65536) if v > 32767 else v
+        ax = s16(d[0],  d[1])  / 16384.0
+        ay = s16(d[2],  d[3])  / 16384.0
+        az = s16(d[4],  d[5])  / 16384.0
+        gx = s16(d[8],  d[9])  / 131.0
+        gy = s16(d[10], d[11]) / 131.0
+        gz = s16(d[12], d[13]) / 131.0
+        return ax, ay, az, gx, gy, gz
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
 from .xlerobot import XLerobot
 from .config_xlerobot import XLerobotConfig, XLerobotHostConfig
 
@@ -102,6 +128,14 @@ def main():
                     last_observation[cam_key] = base64.b64encode(buffer).decode("utf-8")
                 else:
                     last_observation[cam_key] = ""
+
+            ax, ay, az, gx, gy, gz = _read_imu()
+            last_observation["imu_ax"] = ax
+            last_observation["imu_ay"] = ay
+            last_observation["imu_az"] = az
+            last_observation["imu_gx"] = gx
+            last_observation["imu_gy"] = gy
+            last_observation["imu_gz"] = gz
 
             # Send the observation to the remote agent
             try:
