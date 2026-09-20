@@ -30,6 +30,30 @@ try:
 except Exception:
     IMU_OK = False
 
+try:
+    from ultralytics import YOLO as _YOLO
+    _yolo_model = _YOLO("yolo11n.pt")
+    YOLO_OK = True
+except Exception:
+    YOLO_OK = False
+
+def _run_yolo(frame):
+    if not YOLO_OK or frame is None:
+        return []
+    try:
+        results = _yolo_model(frame, conf=0.3, verbose=False)[0]
+        boxes = []
+        for box in results.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            conf = float(box.conf[0])
+            cls = int(box.cls[0])
+            label = _yolo_model.names[cls]
+            boxes.append({"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
+                          "conf": round(conf, 2), "label": label})
+        return boxes
+    except Exception:
+        return []
+
 def _read_imu():
     if not IMU_OK:
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -121,8 +145,9 @@ def main():
                 if last_observation.get(cam_key) is None:
                     last_observation[cam_key] = ""
                     continue
+                raw_frame = last_observation[cam_key]
                 ret, buffer = cv2.imencode(
-                    ".jpg", last_observation[cam_key], [int(cv2.IMWRITE_JPEG_QUALITY), 50]
+                    ".jpg", raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50]
                 )
                 if ret:
                     last_observation[cam_key] = base64.b64encode(buffer).decode("utf-8")

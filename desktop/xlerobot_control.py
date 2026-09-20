@@ -22,14 +22,50 @@ try:
     from lerobot.teleoperators.bi_so_leader import BiSOLeader
     from lerobot.teleoperators.bi_so_leader.config_bi_so_leader import BiSOLeaderConfig
     from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfig
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.utils.constants import HF_LEROBOT_HOME
     LEROBOT_OK = True
 except ImportError:
     LEROBOT_OK = False
 
 
+ARM_KEYS_L = ["left_arm_shoulder_pan", "left_arm_shoulder_lift", "left_arm_elbow_flex",
+              "left_arm_wrist_flex", "left_arm_wrist_roll", "left_arm_gripper"]
+ARM_KEYS_R = ["right_arm_shoulder_pan", "right_arm_shoulder_lift", "right_arm_elbow_flex",
+              "right_arm_wrist_flex", "right_arm_wrist_roll", "right_arm_gripper"]
+STATE_KEYS = [f"{k}.pos" for k in ARM_KEYS_L + ARM_KEYS_R] + ["head_motor_1.pos", "head_motor_2.pos"]
+ACTION_KEYS = [f"{k}.pos" for k in ARM_KEYS_L + ARM_KEYS_R] + [
+    "head_motor_1.pos", "head_motor_2.pos", "x.vel", "y.vel", "theta.vel"
+]
+DATASET_FEATURES = {
+    "observation.state": {"dtype": "float32", "shape": (len(STATE_KEYS),), "names": STATE_KEYS},
+    "action": {"dtype": "float32", "shape": (len(ACTION_KEYS),), "names": ACTION_KEYS},
+    "observation.images.head": {"dtype": "video", "shape": (480, 640, 3),
+                                 "names": ["height", "width", "channels"]},
+    "observation.images.left_wrist": {"dtype": "video", "shape": (240, 320, 3),
+                                       "names": ["height", "width", "channels"]},
+    "observation.images.right_wrist": {"dtype": "video", "shape": (240, 320, 3),
+                                        "names": ["height", "width", "channels"]},
+}
+
+
+def _decode_b64_image(b64):
+    if not b64:
+        return None
+    try:
+        arr = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
+        f = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if f is None:
+            return None
+        return cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+    except Exception:
+        return None
+
+
 class Signals(QObject):
     obs_received   = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
+    upload_done    = pyqtSignal(bool, str)
 
 
 class ControlThread(threading.Thread):
@@ -42,6 +78,7 @@ class ControlThread(threading.Thread):
         self._lock = threading.Lock()
         self.head_pan = self.head_tilt = 0.0
         self.wx = self.wy = self.wt = 0.0
+        self.last_action = {}
 
     def set_head(self, pan, tilt):
         with self._lock:
@@ -82,6 +119,7 @@ class ControlThread(threading.Thread):
                             "head_motor_2.pos": self.head_tilt,
                             "x.vel": self.wx, "y.vel": self.wy, "theta.vel": self.wt,
                         })
+                    self.last_action = dict(action)
                     self.cmd_sock.send_string(json.dumps(action))
                     try:
                         msg = self.obs_sock.recv_string(flags=zmq.NOBLOCK)
@@ -189,13 +227,18 @@ class CamLabel(QLabel):
         self.setStyleSheet("background:#0d1117; color:#58a6ff; border:1px solid #30363d; font-size:13px;")
         self.setMinimumSize(200, 150)
 
-    def show_frame(self, b64):
+    def show_frame(self, b64, boxes=None):
         if not b64: return
         try:
             arr = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
             f = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if f is None: return
-            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            if boxes:
+                for b in boxes:
+                    cv2.rectangle(f, (b["x1"], b["y1"]), (b["x2"], b["y2"]), (0, 255, 0), 2)
+                    cv2.putText(f, f"{b['label']} {b['conf']:.2f}",
+                                (b["x1"], max(b["y1"]-6, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             h, w, c = f.shape
             qi = QImage(f.data, w, h, w*c, QImage.Format_RGB888)
             self.setPixmap(QPixmap.fromImage(qi).scaled(
@@ -211,8 +254,9 @@ class MainWindow(QMainWindow):
         self.signals = Signals()
         self.signals.obs_received.connect(self._on_obs)
         self.signals.status_changed.connect(lambda m: self.statusBar().showMessage(m))
+        self.signals.upload_done.connect(self._on_upload_done)
         self.ctrl = None
-        self.head_pan = self.head_tilt = 0.0
+        self.head_pan, self.head_tilt = -4.0, 70.0
         self.pressed = set()
         self.HEAD_STEP = 2.0
         self.SPD = 0.2
@@ -224,6 +268,9 @@ class MainWindow(QMainWindow):
         self._calib_samples = []
         self._arm_joints = {'left': [0.0]*6, 'right': [0.0]*6}
         self._viz_counter = 0
+        self.dataset = None
+        self.recording = False
+        self.episode_count = 0
         self._build_ui()
         t = QTimer(self); t.timeout.connect(self._tick); t.start(50)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -315,6 +362,37 @@ class MainWindow(QMainWindow):
         rb = QWidget(); rb.setStyleSheet("background:#161b22;")
         rl2 = QVBoxLayout(rb); rl2.setContentsMargins(8,8,8,8); rl2.setSpacing(8)
 
+        # 데이터 녹화
+        rg = QGroupBox("데이터 녹화"); rg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
+        rfl = QVBoxLayout(rg); rfl.setSpacing(4)
+        self.f_repo = QLineEdit("bigse0u1/xlerobot_3block_pilot")
+        self.f_task = QLineEdit("Pick up the block")
+        rfl.addWidget(QLabel("Repo ID:")); rfl.addWidget(self.f_repo)
+        rfl.addWidget(QLabel("Task 설명:")); rfl.addWidget(self.f_task)
+        self.btn_dataset = QPushButton("데이터셋 생성")
+        self.btn_dataset.setStyleSheet("QPushButton{background:#238636;color:white;padding:6px;border-radius:4px;}")
+        self.btn_dataset.clicked.connect(self._toggle_dataset)
+        rfl.addWidget(self.btn_dataset)
+        self.btn_episode = QPushButton("● 에피소드 녹화 시작")
+        self.btn_episode.setEnabled(False)
+        self.btn_episode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+        self.btn_episode.clicked.connect(self._toggle_episode)
+        rfl.addWidget(self.btn_episode)
+        self.btn_discard = QPushButton("현재 에피소드 폐기")
+        self.btn_discard.setEnabled(False)
+        self.btn_discard.setStyleSheet("QPushButton{background:#da3633;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+        self.btn_discard.clicked.connect(self._discard_episode)
+        rfl.addWidget(self.btn_discard)
+        self.l_episode_count = QLabel("녹화된 에피소드: 0")
+        self.l_episode_count.setStyleSheet("color:#7ee787;font-family:monospace;")
+        rfl.addWidget(self.l_episode_count)
+        self.btn_upload = QPushButton("허깅페이스 업로드")
+        self.btn_upload.setEnabled(False)
+        self.btn_upload.setStyleSheet("QPushButton{background:#8957e5;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+        self.btn_upload.clicked.connect(self._upload_dataset)
+        rfl.addWidget(self.btn_upload)
+        rl2.addWidget(rg)
+
         # IMU
         ig = QGroupBox("IMU"); ig.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
         il = QVBoxLayout(ig); il.setSpacing(4)
@@ -367,6 +445,125 @@ class MainWindow(QMainWindow):
         self._calib_samples = []
         self.imu_yaw.setText("Yaw: 캘리브레이션 중... (가만히 있으세요)")
 
+    def _toggle_dataset(self):
+        if self.dataset is None:
+            if not LEROBOT_OK:
+                self.statusBar().showMessage("lerobot 데이터셋 모듈을 불러올 수 없음")
+                return
+            repo_id = self.f_repo.text()
+            existing = (HF_LEROBOT_HOME / repo_id).exists()
+            try:
+                if existing:
+                    self.dataset = LeRobotDataset.resume(
+                        repo_id=repo_id,
+                        root=HF_LEROBOT_HOME / repo_id,
+                        image_writer_threads=4,
+                    )
+                    self.episode_count = self.dataset.meta.total_episodes
+                    msg = f"기존 데이터셋 이어서 녹화: {repo_id} (기존 {self.episode_count}개)"
+                else:
+                    self.dataset = LeRobotDataset.create(
+                        repo_id=repo_id,
+                        fps=30,
+                        features=DATASET_FEATURES,
+                        robot_type="xlerobot",
+                        use_videos=True,
+                        image_writer_threads=4,
+                    )
+                    self.episode_count = 0
+                    msg = f"데이터셋 생성됨: {repo_id}"
+                self.l_episode_count.setText(f"녹화된 에피소드: {self.episode_count}")
+                self.btn_dataset.setText("데이터셋 종료")
+                self.btn_episode.setEnabled(True)
+                self.btn_upload.setEnabled(True)
+                self.f_repo.setEnabled(False)
+                self.statusBar().showMessage(msg)
+            except Exception as e:
+                self.statusBar().showMessage(f"데이터셋 열기 실패: {e}")
+        else:
+            if self.recording:
+                self._toggle_episode()
+            self.dataset = None
+            self.btn_dataset.setText("데이터셋 생성")
+            self.btn_episode.setEnabled(False)
+            self.btn_discard.setEnabled(False)
+            self.btn_upload.setEnabled(False)
+            self.f_repo.setEnabled(True)
+            self.statusBar().showMessage("데이터셋 세션 종료")
+
+    def _toggle_episode(self):
+        if self.dataset is None:
+            return
+        if not self.recording:
+            self.recording = True
+            self.btn_episode.setText("■ 에피소드 저장")
+            self.btn_discard.setEnabled(True)
+            self.statusBar().showMessage("녹화 중...")
+        else:
+            self.recording = False
+            try:
+                self.dataset.save_episode()
+                self.episode_count += 1
+                self.l_episode_count.setText(f"녹화된 에피소드: {self.episode_count}")
+                self.statusBar().showMessage(f"에피소드 {self.episode_count} 저장됨")
+            except Exception as e:
+                self.statusBar().showMessage(f"저장 실패: {e}")
+            self.btn_episode.setText("● 에피소드 녹화 시작")
+            self.btn_discard.setEnabled(False)
+
+    def _discard_episode(self):
+        if self.dataset is None or not self.recording:
+            return
+        try:
+            self.dataset.clear_episode_buffer()
+        except Exception:
+            pass
+        self.recording = False
+        self.btn_episode.setText("● 에피소드 녹화 시작")
+        self.btn_discard.setEnabled(False)
+        self.statusBar().showMessage("에피소드 폐기됨")
+
+    def _upload_dataset(self):
+        if self.dataset is None or self.recording:
+            return
+        self.btn_upload.setEnabled(False)
+        self.btn_episode.setEnabled(False)
+        self.btn_discard.setEnabled(False)
+        self.statusBar().showMessage("허깅페이스 업로드 중... (에피소드 수에 따라 수 분 소요)")
+        dataset = self.dataset
+
+        def _do_upload():
+            try:
+                dataset.finalize()
+                dataset.push_to_hub()
+                self.signals.upload_done.emit(True, "허깅페이스 업로드 완료 ✓")
+            except Exception as e:
+                self.signals.upload_done.emit(False, f"업로드 실패: {e}")
+
+        threading.Thread(target=_do_upload, daemon=True).start()
+
+    def _on_upload_done(self, ok, msg):
+        self.statusBar().showMessage(msg)
+        self.btn_upload.setEnabled(not ok)
+
+    def _capture_frame(self, obs):
+        head_img = _decode_b64_image(obs.get("head", ""))
+        left_img = _decode_b64_image(obs.get("left_wrist", ""))
+        right_img = _decode_b64_image(obs.get("right_wrist", ""))
+        if head_img is None or left_img is None or right_img is None:
+            return None
+        state = np.array([obs.get(k, 0.0) or 0.0 for k in STATE_KEYS], dtype=np.float32)
+        action_src = self.ctrl.last_action if self.ctrl else {}
+        action = np.array([action_src.get(k, 0.0) or 0.0 for k in ACTION_KEYS], dtype=np.float32)
+        return {
+            "observation.images.head": head_img,
+            "observation.images.left_wrist": left_img,
+            "observation.images.right_wrist": right_img,
+            "observation.state": state,
+            "action": action,
+            "task": self.f_task.text(),
+        }
+
     def _toggle(self):
         if self.ctrl and self.ctrl.running:
             self.ctrl.stop()
@@ -389,10 +586,6 @@ class MainWindow(QMainWindow):
         self.cam_right.show_frame(obs.get("right_wrist", ""))
 
         # 팔 상태
-        arm_keys_l = ["left_arm_shoulder_pan","left_arm_shoulder_lift","left_arm_elbow_flex",
-                      "left_arm_wrist_flex","left_arm_wrist_roll","left_arm_gripper"]
-        arm_keys_r = ["right_arm_shoulder_pan","right_arm_shoulder_lift","right_arm_elbow_flex",
-                      "right_arm_wrist_flex","right_arm_wrist_roll","right_arm_gripper"]
         for key, lbl in self.arm_lbls.items():
             v = obs.get(f"{key}.pos")
             if v is not None: lbl.setText(f"{v:.1f}")
@@ -400,9 +593,18 @@ class MainWindow(QMainWindow):
         # 3D 포즈 업데이트 (매 5프레임마다)
         self._viz_counter += 1
         if self._viz_counter % 5 == 0 and self.robot_viz:
-            lj = [obs.get(f"{k}.pos", 0.0) or 0.0 for k in arm_keys_l]
-            rj = [obs.get(f"{k}.pos", 0.0) or 0.0 for k in arm_keys_r]
+            lj = [obs.get(f"{k}.pos", 0.0) or 0.0 for k in ARM_KEYS_L]
+            rj = [obs.get(f"{k}.pos", 0.0) or 0.0 for k in ARM_KEYS_R]
             self.robot_viz.update_pose(lj, rj)
+
+        # 데이터 녹화
+        if self.dataset is not None and self.recording:
+            frame = self._capture_frame(obs)
+            if frame is not None:
+                try:
+                    self.dataset.add_frame(frame)
+                except Exception as e:
+                    self.statusBar().showMessage(f"프레임 기록 실패: {e}")
 
         # IMU
         gx = obs.get("imu_gx", 0.0); gy = obs.get("imu_gy", 0.0); gz = obs.get("imu_gz", 0.0)
@@ -455,6 +657,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         if self.ctrl: self.ctrl.stop()
+        if self.dataset is not None:
+            if self.recording:
+                try: self.dataset.clear_episode_buffer()
+                except Exception: pass
         e.accept()
 
 
