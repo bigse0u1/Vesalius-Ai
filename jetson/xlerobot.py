@@ -642,7 +642,32 @@ class XLerobot(Robot):
         obs_dict = {**left_arm_state, **right_arm_state, **head_state, **base_vel, **camera_obs}
 
         return obs_dict
-    
+
+    def get_temperature_observation(self) -> dict[str, Any]:
+        """Read Present_Temperature (°C) for every motor. Slower than position reads
+        (17 individual/grouped reads), so callers should poll this at a lower rate."""
+        def _safe_read_temp(bus, motors, cache_attr):
+            try:
+                result = bus.sync_read("Present_Temperature", motors, num_retry=0)
+                setattr(self, cache_attr, result)
+                return result
+            except Exception:
+                return getattr(self, cache_attr, {m: 0 for m in motors})
+
+        left_arm_temp = _safe_read_temp(self.bus1, self.left_arm_motors, "_cache_left_arm_temp")
+        head_temp = _safe_read_temp(self.bus1, self.head_motors, "_cache_head_temp")
+
+        right_arm_temp = {}
+        for _m in self.right_arm_motors:
+            try:
+                right_arm_temp[_m] = self.bus2.read("Present_Temperature", _m)
+            except Exception:
+                right_arm_temp[_m] = self._cache_right_arm_temp.get(_m, 0) if hasattr(self, "_cache_right_arm_temp") else 0
+        self._cache_right_arm_temp = right_arm_temp
+
+        temps = {**left_arm_temp, **right_arm_temp, **head_temp}
+        return {f"{k}.temp": v for k, v in temps.items()}
+
     def get_camera_observation(self):
         obs_dict = {}
         for cam_key, cam in self.cameras.items():
@@ -683,6 +708,12 @@ class XLerobot(Robot):
             else:
                 remapped[key] = value
         action = remapped
+
+        # Leader/follower grippers close in opposite directions on this hardware
+        if "left_arm_gripper.pos" in action:
+            action["left_arm_gripper.pos"] = 100.0 - action["left_arm_gripper.pos"]
+        if "right_arm_gripper.pos" in action:
+            action["right_arm_gripper.pos"] = 100.0 - action["right_arm_gripper.pos"]
 
         left_arm_pos = {k: v for k, v in action.items() if k.startswith("left_arm_") and k.endswith(".pos")}
         right_arm_pos = {k: v for k, v in action.items() if k.startswith("right_arm_") and k.endswith(".pos")}

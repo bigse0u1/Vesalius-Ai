@@ -111,6 +111,9 @@ def main():
 
     last_cmd_time = time.time()
     watchdog_active = False
+    last_temps = {}
+    loop_count = 0
+    TEMP_POLL_EVERY_N_LOOPS = 30  # ~once per second at 30Hz
     logging.info("Waiting for commands...")
     try:
         # Business logic
@@ -139,6 +142,14 @@ def main():
                 robot.stop_base()
 
             last_observation = robot.get_observation()
+
+            loop_count += 1
+            if loop_count % TEMP_POLL_EVERY_N_LOOPS == 0:
+                try:
+                    last_temps = robot.get_temperature_observation()
+                except Exception as e:
+                    logging.debug("Temperature read failed: %s", e)
+            last_observation.update(last_temps)
 
             # Encode ndarrays to base64 strings
             for cam_key, _ in robot.cameras.items():

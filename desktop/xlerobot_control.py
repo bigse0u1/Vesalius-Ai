@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, json, time, base64, threading
+import sys, os, json, time, base64, threading
 import numpy as np
 import cv2
 import zmq
@@ -24,6 +24,11 @@ try:
     from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.utils.constants import HF_LEROBOT_HOME
+    import torch
+    from lerobot.common.control_utils import predict_action
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+    from lerobot.utils.device_utils import get_safe_torch_device
     LEROBOT_OK = True
 except ImportError:
     LEROBOT_OK = False
@@ -33,6 +38,15 @@ ARM_KEYS_L = ["left_arm_shoulder_pan", "left_arm_shoulder_lift", "left_arm_elbow
               "left_arm_wrist_flex", "left_arm_wrist_roll", "left_arm_gripper"]
 ARM_KEYS_R = ["right_arm_shoulder_pan", "right_arm_shoulder_lift", "right_arm_elbow_flex",
               "right_arm_wrist_flex", "right_arm_wrist_roll", "right_arm_gripper"]
+TEMP_MOTOR_PAIRS = [
+    ("L 숄더팬", "left_arm_shoulder_pan"), ("L 숄더리프트", "left_arm_shoulder_lift"),
+    ("L 엘보", "left_arm_elbow_flex"), ("L 손목F", "left_arm_wrist_flex"),
+    ("L 손목R", "left_arm_wrist_roll"), ("L 그리퍼", "left_arm_gripper"),
+    ("R 숄더팬", "right_arm_shoulder_pan"), ("R 숄더리프트", "right_arm_shoulder_lift"),
+    ("R 엘보", "right_arm_elbow_flex"), ("R 손목F", "right_arm_wrist_flex"),
+    ("R 손목R", "right_arm_wrist_roll"), ("R 그리퍼", "right_arm_gripper"),
+    ("헤드 팬", "head_motor_1"), ("헤드 틸트", "head_motor_2"),
+]
 STATE_KEYS = [f"{k}.pos" for k in ARM_KEYS_L + ARM_KEYS_R] + ["head_motor_1.pos", "head_motor_2.pos"]
 ACTION_KEYS = [f"{k}.pos" for k in ARM_KEYS_L + ARM_KEYS_R] + [
     "head_motor_1.pos", "head_motor_2.pos", "x.vel", "y.vel", "theta.vel"
@@ -55,9 +69,7 @@ def _decode_b64_image(b64):
     try:
         arr = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
         f = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if f is None:
-            return None
-        return cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+        return f  # already RGB-ordered after the encode/decode round trip (see CamLabel.show_frame)
     except Exception:
         return None
 
@@ -66,6 +78,7 @@ class Signals(QObject):
     obs_received   = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
     upload_done    = pyqtSignal(bool, str)
+    policy_loaded  = pyqtSignal(bool, str)
 
 
 class ControlThread(threading.Thread):
@@ -79,6 +92,13 @@ class ControlThread(threading.Thread):
         self.head_pan = self.head_tilt = 0.0
         self.wx = self.wy = self.wt = 0.0
         self.last_action = {}
+        self._latest_obs = None
+        self.ai_mode = False
+        self.policy = None
+        self.preprocessor = None
+        self.postprocessor = None
+        self.device = None
+        self.ai_task = ""
 
     def set_head(self, pan, tilt):
         with self._lock:
@@ -87,6 +107,35 @@ class ControlThread(threading.Thread):
     def set_wheels(self, x, y, theta):
         with self._lock:
             self.wx, self.wy, self.wt = x, y, theta
+
+    def _infer_action(self):
+        obs = self._latest_obs
+        if obs is None:
+            return None
+        head_img = _decode_b64_image(obs.get("head", ""))
+        left_img = _decode_b64_image(obs.get("left_wrist", ""))
+        right_img = _decode_b64_image(obs.get("right_wrist", ""))
+        if head_img is None or left_img is None or right_img is None:
+            return None
+        state = np.array([obs.get(k, 0.0) or 0.0 for k in STATE_KEYS], dtype=np.float32)
+        inference_obs = {
+            "observation.images.head": head_img,
+            "observation.images.left_wrist": left_img,
+            "observation.images.right_wrist": right_img,
+            "observation.state": state,
+        }
+        action_out = predict_action(
+            inference_obs, self.policy, self.device,
+            self.preprocessor, self.postprocessor,
+            use_amp=False, task=self.ai_task,
+        )
+        if isinstance(action_out, dict):
+            action_out = action_out.get("action", next(iter(action_out.values())))
+        action_out = action_out.detach().to("cpu")
+        if action_out.dim() > 1:
+            action_out = action_out.squeeze(0)
+        action_vec = action_out.numpy()
+        return {k: float(v) for k, v in zip(ACTION_KEYS, action_vec)}
 
     def run(self):
         try:
@@ -112,7 +161,29 @@ class ControlThread(threading.Thread):
 
             while self.running:
                 try:
-                    action = self.teleop.get_action()
+                    try:
+                        msg = self.obs_sock.recv_string(flags=zmq.NOBLOCK)
+                        self._latest_obs = json.loads(msg)
+                        self.signals.obs_received.emit(self._latest_obs)
+                    except zmq.Again:
+                        pass
+
+                    if self.ai_mode and self.policy is not None:
+                        action = self._infer_action()
+                        if action is None:
+                            time.sleep(1/60)
+                            continue
+                    else:
+                        action = self.teleop.get_action()
+                        # BiSOLeader returns "left_shoulder_pan.pos" etc; the dataset/policy
+                        # convention (and the robot's own remap) expects "left_arm_shoulder_pan.pos"
+                        action = {
+                            ("left_arm_" + k[len("left_"):]) if k.startswith("left_") and not k.startswith("left_arm_")
+                            else ("right_arm_" + k[len("right_"):]) if k.startswith("right_") and not k.startswith("right_arm_")
+                            else k: v
+                            for k, v in action.items()
+                        }
+
                     with self._lock:
                         action.update({
                             "head_motor_1.pos": self.head_pan,
@@ -121,11 +192,6 @@ class ControlThread(threading.Thread):
                         })
                     self.last_action = dict(action)
                     self.cmd_sock.send_string(json.dumps(action))
-                    try:
-                        msg = self.obs_sock.recv_string(flags=zmq.NOBLOCK)
-                        self.signals.obs_received.emit(json.loads(msg))
-                    except zmq.Again:
-                        pass
                     time.sleep(1/60)
                 except Exception as e:
                     self.signals.status_changed.emit(f"오류: {e}")
@@ -162,6 +228,32 @@ class ImuBar(QWidget):
         ratio = (v - self.mn) / (self.mx - self.mn)
         self.bar.setValue(int(max(0, min(1000, ratio * 1000))))
         self.num.setText(f"{v:+.1f}")
+
+
+class TempPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        fl = QFormLayout(self); fl.setSpacing(3); fl.setContentsMargins(0, 0, 0, 0)
+        self.labels = {}
+        for short, key in TEMP_MOTOR_PAIRS:
+            l = QLabel("--°C")
+            l.setStyleSheet("color:#7ee787;font-family:monospace;font-size:11px;font-weight:bold;")
+            fl.addRow(short + ":", l)
+            self.labels[key] = l
+
+    def update_temps(self, obs):
+        for key, lbl in self.labels.items():
+            v = obs.get(f"{key}.temp")
+            if v is None:
+                continue
+            if v >= 65:
+                color = "#ff7b72"
+            elif v >= 50:
+                color = "#f0883e"
+            else:
+                color = "#7ee787"
+            lbl.setText(f"{v}°C")
+            lbl.setStyleSheet(f"color:{color};font-family:monospace;font-size:11px;font-weight:bold;")
 
 
 class RobotVizWidget(FigureCanvasQTAgg if MPL_OK else QWidget):
@@ -255,7 +347,12 @@ class MainWindow(QMainWindow):
         self.signals.obs_received.connect(self._on_obs)
         self.signals.status_changed.connect(lambda m: self.statusBar().showMessage(m))
         self.signals.upload_done.connect(self._on_upload_done)
+        self.signals.policy_loaded.connect(self._on_policy_loaded)
         self.ctrl = None
+        self.policy = None
+        self.preprocessor = None
+        self.postprocessor = None
+        self.device = None
         self.head_pan, self.head_tilt = -4.0, 70.0
         self.pressed = set()
         self.HEAD_STEP = 2.0
@@ -338,6 +435,30 @@ class MainWindow(QMainWindow):
             l = QLabel("—"); l.setStyleSheet("color:#7ee787;font-family:monospace;font-size:11px;")
             afl.addRow(short+":", l); self.arm_lbls[key] = l
         sl.addWidget(ag)
+
+        # AI 추론
+        aig = QGroupBox("AI 추론 (실험적)"); aig.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
+        aifl = QVBoxLayout(aig); aifl.setSpacing(4)
+        default_ckpt = os.path.expanduser(
+            "~/lerobot/outputs/train/act_test10/checkpoints/last/pretrained_model")
+        self.f_policy_path = QLineEdit(default_ckpt)
+        self.f_ai_task = QLineEdit("Pick up the block")
+        aifl.addWidget(QLabel("체크포인트 경로:")); aifl.addWidget(self.f_policy_path)
+        aifl.addWidget(QLabel("Task 설명:")); aifl.addWidget(self.f_ai_task)
+        self.btn_load_policy = QPushButton("정책 로드")
+        self.btn_load_policy.setStyleSheet("QPushButton{background:#8957e5;color:white;padding:6px;border-radius:4px;}")
+        self.btn_load_policy.clicked.connect(self._load_policy)
+        aifl.addWidget(self.btn_load_policy)
+        self.btn_ai_mode = QPushButton("AI 모드 시작")
+        self.btn_ai_mode.setEnabled(False)
+        self.btn_ai_mode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+        self.btn_ai_mode.clicked.connect(self._toggle_ai_mode)
+        aifl.addWidget(self.btn_ai_mode)
+        self.l_ai_status = QLabel("정책 로드 안 됨")
+        self.l_ai_status.setStyleSheet("color:#8b949e;font-size:11px;")
+        self.l_ai_status.setWordWrap(True)
+        aifl.addWidget(self.l_ai_status)
+        sl.addWidget(aig)
         sl.addStretch()
         scroll_l.setWidget(sb)
         rl.addWidget(scroll_l)
@@ -365,7 +486,7 @@ class MainWindow(QMainWindow):
         # 데이터 녹화
         rg = QGroupBox("데이터 녹화"); rg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
         rfl = QVBoxLayout(rg); rfl.setSpacing(4)
-        self.f_repo = QLineEdit("bigse0u1/xlerobot_3block_pilot")
+        self.f_repo = QLineEdit("bigse0u1/xlerobot_1block_test10")
         self.f_task = QLineEdit("Pick up the block")
         rfl.addWidget(QLabel("Repo ID:")); rfl.addWidget(self.f_repo)
         rfl.addWidget(QLabel("Task 설명:")); rfl.addWidget(self.f_task)
@@ -419,6 +540,13 @@ class MainWindow(QMainWindow):
         yaw_row.addWidget(self.imu_yaw); yaw_row.addWidget(yaw_reset)
         il.addLayout(yaw_row)
         rl2.addWidget(ig)
+
+        # 모터 온도
+        tg = QGroupBox("모터 온도"); tg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
+        tl = QVBoxLayout(tg)
+        self.temp_panel = TempPanel()
+        tl.addWidget(self.temp_panel)
+        rl2.addWidget(tg)
 
         # 3D 로봇 포즈
         vg = QGroupBox("로봇 포즈 (3D)"); vg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
@@ -546,6 +674,57 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
         self.btn_upload.setEnabled(not ok)
 
+    def _load_policy(self):
+        if not LEROBOT_OK:
+            self.l_ai_status.setText("lerobot 정책 모듈을 불러올 수 없음")
+            return
+        path = self.f_policy_path.text()
+        self.btn_load_policy.setEnabled(False)
+        self.l_ai_status.setText("정책 로드 중...")
+
+        def _do_load():
+            try:
+                policy_cfg = PreTrainedConfig.from_pretrained(path)
+                policy_cls = get_policy_class(policy_cfg.type)
+                policy = policy_cls.from_pretrained(path)
+                device = get_safe_torch_device(policy_cfg.device if policy_cfg.device else "cuda")
+                policy.to(device)
+                policy.eval()
+                preprocessor, postprocessor = make_pre_post_processors(policy_cfg, pretrained_path=path)
+                self.policy, self.preprocessor, self.postprocessor, self.device = (
+                    policy, preprocessor, postprocessor, device
+                )
+                self.signals.policy_loaded.emit(True, f"정책 로드 완료 ({policy_cfg.type}, {device})")
+            except Exception as e:
+                self.signals.policy_loaded.emit(False, f"정책 로드 실패: {e}")
+
+        threading.Thread(target=_do_load, daemon=True).start()
+
+    def _on_policy_loaded(self, ok, msg):
+        self.l_ai_status.setText(msg)
+        self.btn_load_policy.setEnabled(True)
+        self.btn_ai_mode.setEnabled(ok)
+
+    def _toggle_ai_mode(self):
+        if not self.ctrl or not self.ctrl.running:
+            self.statusBar().showMessage("먼저 로봇에 연결하세요")
+            return
+        if not self.ctrl.ai_mode:
+            self.ctrl.policy = self.policy
+            self.ctrl.preprocessor = self.preprocessor
+            self.ctrl.postprocessor = self.postprocessor
+            self.ctrl.device = self.device
+            self.ctrl.ai_task = self.f_ai_task.text()
+            self.ctrl.ai_mode = True
+            self.btn_ai_mode.setText("AI 모드 중지")
+            self.btn_ai_mode.setStyleSheet("QPushButton{background:#da3633;color:white;padding:6px;border-radius:4px;}")
+            self.statusBar().showMessage("AI 모드 시작 — 리더암 입력 무시됨")
+        else:
+            self.ctrl.ai_mode = False
+            self.btn_ai_mode.setText("AI 모드 시작")
+            self.btn_ai_mode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+            self.statusBar().showMessage("AI 모드 중지, 리더암 제어로 복귀")
+
     def _capture_frame(self, obs):
         head_img = _decode_b64_image(obs.get("head", ""))
         left_img = _decode_b64_image(obs.get("left_wrist", ""))
@@ -569,6 +748,8 @@ class MainWindow(QMainWindow):
             self.ctrl.stop()
             self.btn.setText("연결")
             self.btn.setStyleSheet("QPushButton{background:#238636;color:white;padding:8px;border-radius:4px;font-weight:bold;}")
+            self.btn_ai_mode.setText("AI 모드 시작")
+            self.btn_ai_mode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
             self.statusBar().showMessage("연결 해제")
         else:
             cfg = dict(ip=self.f_ip.text(), cmd_port=self.f_cmd.text(),
@@ -605,6 +786,9 @@ class MainWindow(QMainWindow):
                     self.dataset.add_frame(frame)
                 except Exception as e:
                     self.statusBar().showMessage(f"프레임 기록 실패: {e}")
+
+        # 모터 온도
+        self.temp_panel.update_temps(obs)
 
         # IMU
         gx = obs.get("imu_gx", 0.0); gy = obs.get("imu_gy", 0.0); gz = obs.get("imu_gz", 0.0)

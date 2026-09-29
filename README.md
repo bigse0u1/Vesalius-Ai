@@ -17,9 +17,12 @@ Remote teleoperation for XLeRobot — leader arms on desktop PC, follower arms +
 - Real-time bimanual teleoperation over ZMQ (leader arms on desktop → follower arms/wheels/head on Jetson)
 - Head + dual wrist camera streaming
 - MPU6050 IMU with gyro-bias calibration and accumulated yaw angle (for precise 90° turns)
+- Live per-motor temperature readout (14 motors: both arms + head)
 - Embedded 3D robot pose visualization (matplotlib, simplified forward kinematics)
 - One-click dataset recording (LeRobotDataset) for imitation learning — episode start/save/discard, resumable across sessions, background upload to Hugging Face
 - Ready for **ACT** / **SmolVLA** training via `lerobot-train`
+- Experimental **AI 모드**: run a trained checkpoint directly on the robot from the control GUI (no separate eval script needed)
+- Standalone Whisper voice-command test script for mapping spoken tool names to canonical labels
 
 ## Architecture
 
@@ -52,6 +55,7 @@ xlerobot_control.py               xlerobot_host.py
 | File | Destination |
 |------|-------------|
 | `desktop/xlerobot_control.py` | anywhere (e.g. `~/xlerobot_control.py`) |
+| `desktop/whisper_test.py` | anywhere, standalone (no robot connection needed) |
 
 ## Installation
 
@@ -111,13 +115,15 @@ python3.12 -m venv ~/lerobot_env312
 source ~/lerobot_env312/bin/activate
 ```
 
-**2. lerobot 설치** (리더암 제어 + 데이터셋 기록에 필요)
+**2. lerobot 설치** (리더암 제어 + 데이터셋 기록 + 학습에 필요)
 
 ```bash
 git clone https://github.com/huggingface/lerobot.git ~/lerobot
 cd ~/lerobot
-pip install -e ".[feetech,dataset]"
+pip install -e ".[feetech,dataset,training]"
 ```
+
+> `training` extra는 `accelerate` 등 `lerobot-train` 실행에 필요한 패키지를 포함합니다. 빠뜨리면 학습이 끝나는 시점에 `ImportError: 'accelerate' is required` 에러가 납니다.
 
 **3. GUI 패키지 설치**
 
@@ -153,10 +159,17 @@ sudo chmod 666 /dev/ttyACM0 /dev/ttyACM1
 sudo usermod -aG dialout $USER  # 재로그인 필요
 ```
 
-**6. Hugging Face 로그인** (데이터셋 업로드에 필요, 선택)
+**6. Hugging Face 로그인** (데이터셋/모델 업로드에 필요, 선택)
 
 ```bash
 hf auth login
+```
+
+**7. Whisper 음성 인식 테스트 패키지** (선택, `whisper_test.py` 사용 시)
+
+```bash
+sudo apt-get install -y portaudio19-dev libportaudio2
+pip install faster-whisper sounddevice
 ```
 
 ## Motor Port Mapping
@@ -228,6 +241,10 @@ The right panel shows live gyro/accel bars and an accumulated **Yaw** angle (use
 2. Click **초기화** (reset). The GUI samples ~1 second of gyro data to measure the static bias.
 3. Once calibration finishes ("bias=X.XX°/s 보정됨"), Yaw tracks rotation accurately from that reference point.
 
+## Motor Temperature
+
+The right panel's **모터 온도** section polls `Present_Temperature` on all 14 arm/head motors (~once per second — polling every motor on every control tick would slow the loop down). Color-coded: green < 50°C, orange 50–65°C, red ≥ 65°C (rule-of-thumb thresholds for STS3215, adjust as needed).
+
 ## Data Recording (for ACT / SmolVLA training)
 
 The right panel's **데이터 녹화** section records demonstrations directly into a [LeRobotDataset](https://github.com/huggingface/lerobot):
@@ -237,6 +254,8 @@ The right panel's **데이터 녹화** section records demonstrations directly i
 3. Click **● 에피소드 녹화 시작**, perform the demonstration with the leader arms, then **■ 에피소드 저장**. Use **현재 에피소드 폐기** to discard a bad take before saving.
 4. Repeat for ~50+ episodes (see [LeRobot's data collection guide](https://github.com/huggingface/lerobot) for tips: vary object position/color, keep demonstrations consistent).
 5. Click **데이터셋 종료** when done for the session, then **허깅페이스 업로드** to push to the Hub (optional, runs in the background).
+
+> After recording a batch, it's worth sanity-checking that the saved `action` values actually vary across a trajectory (`ds[i]['action']` for a few frames of one episode) before spending an hour training on them — a silent all-zero `action` column (frozen policy at eval time) is the single easiest way to waste a training run.
 
 ### Training
 
@@ -254,9 +273,34 @@ lerobot-train \
 
 Swap `--policy.type=act` for `smolvla` to try a language-conditioned VLA instead. See `lerobot-train --help` and the [LeRobot docs](https://github.com/huggingface/lerobot) for more options.
 
+## AI Inference Mode (run a trained policy on the robot)
+
+The left sidebar's **AI 추론 (실험적)** section loads a trained checkpoint and lets it drive both arms directly from the GUI — no separate `lerobot-eval`/`lerobot-record` process needed (XLeRobot's ZMQ host/client split isn't a standard registered lerobot `Robot`, so the usual real-robot eval CLIs don't apply here; this reuses the exact same ZMQ pipeline as teleoperation).
+
+1. Set **체크포인트 경로** to a `pretrained_model` directory (e.g. `outputs/train/<task_name>/checkpoints/last/pretrained_model`) and **Task 설명** (should match what was used at training time).
+2. Click **정책 로드** (loads in the background; watch the status line below the button).
+3. Once loaded, **AI 모드 시작** hands both arms to the policy — leader-arm input is ignored while active. **AI 모드 중지** returns control to the leader arms.
+4. Stay ready to stop the robot (button, or just close the GUI) — an undertrained policy can produce unexpected motion.
+
+## Voice Command Testing (Whisper)
+
+`desktop/whisper_test.py` is a standalone mic → [faster-whisper](https://github.com/SYSTRAN/faster-whisper) → canonical-tool-name script, useful for prototyping the "의사 음성 요청 → 도구 선택" pipeline before wiring it into the robot.
+
+```bash
+python3 desktop/whisper_test.py            # "small" model, CPU
+python3 desktop/whisper_test.py medium     # bigger model = better accuracy, slower
+```
+
+Press `ENTER`, say a tool name (Korean or English), press `ENTER` again to stop, and it prints the transcription plus the matched canonical label. Edit `TOOL_ALIASES` in the script to add more phrases per tool.
+
+> Runs on CPU (`compute_type="int8"`) by default — `faster-whisper`/`ctranslate2` needs its own cuBLAS libraries to use CUDA, which commonly aren't on the library path even when PyTorch's CUDA works fine. CPU is plenty fast for `small`/`medium` on short clips; only bother chasing GPU support if latency becomes a real bottleneck.
+
 ## Known Issues
 
 - Motor 4 may show overheat warning after extended use — let it cool, then resume recording with the same Repo ID
 - `base_right_wheel` (motor 9) not connected in current hardware
 - USB wrist cameras share a hub — 320×240 resolution recommended to avoid bandwidth issues
 - Never mix `opencv-python` and `opencv-python-headless` in the same environment — see the Desktop install section above
+- `BiSOLeader.get_action()` returns keys like `left_shoulder_pan.pos` (no `arm_`); the robot's `send_action()` remaps this to `left_arm_shoulder_pan.pos` server-side, so teleoperation itself always worked, but any code capturing the *raw* teleop action on the desktop (dataset recording, AI-mode logging) must apply the same remap or every recorded arm action silently ends up `0.0`. `ControlThread.run()` now does this remap before storing `last_action` — if you fork this code, keep that remap in place.
+- `torchcodec` usually fails to load its CUDA shared libraries and falls back to `pyav` — harmless, just noisy in the logs
+- `faster-whisper` needs its own cuBLAS to use `device="cuda"`; `whisper_test.py` defaults to CPU to sidestep this
