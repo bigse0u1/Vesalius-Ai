@@ -26,9 +26,9 @@
 
 1. Grasper
 2. Bipolar
-3. Hook
+3. Scissors
 4. Clipper
-5. Scissors
+5. Hook
 6. Irrigator
 7. Specimen Bag
 
@@ -113,14 +113,14 @@ Requested Tool = SCISSORS
 
 # 5. Standardized Tray
 
-7개 도구는 정해진 tray 위치에 배치한다.
+7개 도구는 정해진 tray 위치에 왼쪽부터 순서대로 배치한다.
 
 ```text
 Slot 1 = Grasper
 Slot 2 = Bipolar
-Slot 3 = Hook
+Slot 3 = Scissors
 Slot 4 = Clipper
-Slot 5 = Scissors
+Slot 5 = Hook
 Slot 6 = Irrigator
 Slot 7 = Specimen Bag
 ```
@@ -130,9 +130,9 @@ Slot 7 = Specimen Bag
 ```text
 Requested Tool = Scissors
 ↓
-Scissors = Slot 5
+Scissors = Slot 3
 ↓
-Slot 5 접근
+Slot 3 접근
 ```
 
 이 구조를 이용하면 매번 YOLO로 전체 tray에서 도구 위치를 탐색할 필요가 없다.
@@ -144,8 +144,8 @@ Slot 5 접근
 Fixed Slot만 사용할 경우 도구가 잘못 배치되어 있으면 잘못된 도구를 집을 가능성이 있다.
 
 ```text
-Database: Slot 5 = Scissors
-실제:     Slot 5 = Clipper
+Database: Slot 3 = Scissors
+실제:     Slot 3 = Clipper
 ```
 
 이를 방지하기 위해 **손잡이 기반 Visual Verification**을 추가한다.
@@ -366,14 +366,14 @@ Left Arm  → 왼쪽 4개 도구
 Right Arm → 오른쪽 3개 도구
 ```
 
-예시 mapping:
+현재 tray 배치 기준 mapping:
 
 ```text
 Grasper       → LEFT
 Bipolar       → LEFT
-Hook          → LEFT
+Scissors      → LEFT
 Clipper       → LEFT
-Scissors      → RIGHT
+Hook          → RIGHT
 Irrigator     → RIGHT
 Specimen Bag  → RIGHT
 ```
@@ -585,7 +585,7 @@ active_arm
 
 ```text
 held_tool = Scissors
-home_slot = Slot 5
+home_slot = Slot 3
 ```
 
 따라서:
@@ -597,7 +597,7 @@ Tool Retrieval
 ↓
 -90° Rotation
 ↓
-Slot 5
+Slot 3
 ↓
 Place
 ```
@@ -767,8 +767,8 @@ ACT / SmolVLA Pick
 일부러 도구 위치를 바꿔놓는다.
 
 ```text
-정상:       Slot 5 = Scissors
-Disturbance: Slot 5 = Clipper
+정상:       Slot 3 = Scissors
+Disturbance: Slot 3 = Clipper
 ```
 
 Fixed Slot 방식:
@@ -776,7 +776,7 @@ Fixed Slot 방식:
 ```text
 Scissors 요청
 ↓
-Slot 5
+Slot 3
 ↓
 Clipper Pick
 ↓
@@ -788,7 +788,7 @@ Wrong Tool
 ```text
 Scissors 요청
 ↓
-Slot 5
+Slot 3
 ↓
 Classifier
 ↓

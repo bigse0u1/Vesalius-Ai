@@ -452,7 +452,7 @@ class MainWindow(QMainWindow):
         # 연결 설정
         cg = QGroupBox("연결 설정"); cg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
         fl = QFormLayout(cg); fl.setSpacing(4)
-        self.f_ip    = QLineEdit("192.168.0.31")
+        self.f_ip    = QLineEdit("192.168.0.34")
         self.f_cmd   = QLineEdit("5555")
         self.f_obs   = QLineEdit("5556")
         self.f_lport = QLineEdit("/dev/ttyACM0")
