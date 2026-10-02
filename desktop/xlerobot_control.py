@@ -592,7 +592,7 @@ class MainWindow(QMainWindow):
         # 데이터 녹화
         rg = QGroupBox("데이터 녹화"); rg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
         rfl = QVBoxLayout(rg); rfl.setSpacing(4)
-        self.f_repo = QLineEdit("bigse0u1/xlerobot_2tool_pilot")
+        self.f_repo = QLineEdit("bigse0u1/xlerobot_scrub_7tool")
         self.f_task = QLineEdit("Pick up the grasper")
         rfl.addWidget(QLabel("Repo ID:")); rfl.addWidget(self.f_repo)
         rfl.addWidget(QLabel("Task 설명:")); rfl.addWidget(self.f_task)

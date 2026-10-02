@@ -13,13 +13,13 @@ SAMPLE_RATE = 16000
 
 # Canonical label -> phrases that should map to it (lowercased substring match)
 TOOL_ALIASES = {
-    "GRASPER": ["grasper", "그라스퍼", "그래스퍼"],
-    "BIPOLAR": ["bipolar", "바이폴라"],
+    "GRASPER": ["grasper", "그라스퍼", "그래스퍼", "그리스포","Grispo"],
+    "BIPOLAR": ["bipolar", "바이폴라", "바이플라"],
     "HOOK": ["hook", "훅"],
     "CLIPPER": ["clipper", "클리퍼"],
     "SCISSORS": ["scissors", "scissor", "시저", "가위"],
     "IRRIGATOR": ["irrigator", "이리게이터", "이리게이터", "석션"],
-    "SPECIMEN_BAG": ["specimen bag", "스페시먼백", "스페시먼 백", "백"],
+    "SPECIMEN_BAG": ["specimen bag", "스페시먼백", "스페시먼 백", "백", "bag", "back"]
 }
 
 

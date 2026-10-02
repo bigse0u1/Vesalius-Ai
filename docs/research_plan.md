@@ -150,6 +150,21 @@ Database: Slot 3 = Scissors
 
 이를 방지하기 위해 **손잡이 기반 Visual Verification**을 추가한다.
 
+단, 잘못 배치된 것을 감지하고 **경고만 하는 것은 실패**로 본다. 의사 입장에서는 요청한 도구를 받지 못했기 때문이다. 따라서 본 연구의 Visual Verification은 **잘못 놓인 도구를 감지한 뒤, 요청한 도구의 실제 위치를 찾아 올바른 도구를 전달하는 것(Verify & Recover)**을 목표로 한다.
+
+```text
+요청: Scissors
+Database: Scissors = Slot 3
+↓
+Tray 전체 스캔 (7개 slot 분류)
+↓
+실제: Slot 3 = Clipper, Slot 4 = Scissors
+↓
+Slot 4에서 Scissors Pick
+↓
+올바른 도구 전달
+```
+
 ---
 
 # 7. 손잡이 기반 도구 분류
@@ -182,10 +197,45 @@ Predicted = Scissors
 
 ```text
 Requested = Scissors
-Predicted = Clipper
-→ Pick 중단
-→ Error / Recheck
+Slot 3 Predicted = Clipper
+→ 다른 slot에서 Scissors 탐색
+→ Slot 4 Predicted = Scissors
+→ Slot 4에서 Pick
 ```
+
+```text
+Requested = Scissors
+어느 slot에서도 Scissors 미검출 (또는 confidence 낮음)
+→ Pick 중단
+→ 의사에게 알림 / Recheck
+```
+
+경고는 **요청한 도구가 tray 어디에도 없거나 분류 신뢰도가 낮을 때만** 발생한다.
+
+## 7.1 Tray 전체 스캔
+
+요청한 slot 하나만 확인하지 않고, 매 요청마다 head camera 이미지 한 장에서 **7개 slot의 손잡이 ROI를 모두 crop하여 분류**한다.
+
+```text
+Head Camera Image
+↓
+Slot 1~7 Handle ROI Crop
+↓
+Classifier × 7
+↓
+Actual Tray Map
+{1: Grasper, 2: Bipolar, 3: Clipper, 4: Scissors, 5: Hook, 6: Irrigator, 7: Specimen Bag}
+↓
+Requested Tool의 실제 Slot 결정
+```
+
+이미지 한 장에서 crop 7개를 분류하므로 추가 시간은 매우 작다. 단, head camera에서 7개 slot의 손잡이가 모두 충분한 크기로 보이도록 scan 시 head pose를 고정한다.
+
+## 7.2 Classifier 학습 데이터
+
+- 고정 배치 Pick demonstration의 head camera 영상에서 slot ROI를 crop하면 자동으로 label을 얻을 수 있다.
+- 단, 이 데이터만 사용하면 classifier가 **도구의 외형이 아니라 위치**를 학습할 수 있다.
+- 따라서 **도구를 다른 slot에 섞어 배치한 이미지**를 별도로 수집하여 함께 학습한다.
 
 ---
 
@@ -197,13 +247,13 @@ Predicted = Clipper
 - MobileNetV3
 - EfficientNet-B0
 
-Classifier의 역할은 **도구의 위치를 찾는 것**이 아니라 **현재 slot에 있는 도구가 무엇인지 확인하는 것**이다.
+Classifier의 역할은 이미지 전체에서 **도구의 위치를 찾는 것**이 아니라 **각 slot에 있는 도구가 무엇인지 확인하는 것**이다. 7개 slot을 모두 분류한 결과로 요청한 도구의 실제 위치를 알 수 있다.
 
 ---
 
 # 9. YOLO를 우선 사용하지 않는 이유
 
-YOLO는 `무엇인가 + 어디 있는가`를 동시에 해결한다. 하지만 현재 시스템은 standardized tray를 사용하므로 도구 위치를 이미 알고 있다.
+YOLO는 `무엇인가 + 어디 있는가`를 동시에 해결한다. 하지만 현재 시스템은 standardized tray를 사용하므로 도구가 놓일 수 있는 위치(7개 slot)를 이미 알고 있다. 도구가 잘못 놓이더라도 slot 사이에서 바뀌는 것이므로 slot별 분류만으로 실제 위치를 찾을 수 있다.
 
 따라서 현재 단계에서는:
 
@@ -289,6 +339,34 @@ Robot Action
 SmolVLA의 주요 역할은 **도구에 어떻게 접근하고 잡을 것인가**이다.
 
 본 연구에서는 도구 identity의 신뢰성을 높이기 위해 tray prior와 classifier를 추가로 사용한다.
+
+## 12.1 Slot 기반 Instruction Remapping
+
+Pick demonstration은 **고정 배치**(도구 위치 이동 없음, 도구당 100 episodes)로 수집한다. 이 경우 SmolVLA는 `"Pick up the scissors"`를 사실상 **"Slot 3 위치의 도구를 집어라"**로 학습할 가능성이 높다. 따라서 도구가 다른 slot으로 옮겨져 있으면 instruction을 그대로 넣었을 때 원래 slot으로 이동한다.
+
+이를 해결하기 위해 SmolVLA에 넣는 instruction을 **실제 slot의 원래 도구 이름**으로 변환한다.
+
+```text
+Requested = Scissors
+Classifier: Scissors는 실제로 Slot 4에 있음
+Slot 4의 원래 도구 = Clipper
+↓
+SmolVLA Instruction = "Pick up the clipper."
+↓
+Arm이 Slot 4로 이동하여 Scissors Pick
+```
+
+고정 배치 데이터에서는 도구 이름과 slot이 1:1 대응하므로, instruction의 도구 이름을 **slot 지정자**로 사용하는 것이다.
+
+장점:
+
+- 고정 배치 데이터를 그대로 사용하며, 별도의 재수집이 필요 없다.
+- **동일한 SmolVLA 모델**로 Method A(요청 도구 이름을 그대로 입력)와 Method C(remapping된 instruction 입력)를 비교할 수 있다.
+
+주의:
+
+- Slot 4에서 Clipper를 잡도록 학습된 동작으로 Scissors를 잡게 되므로, 손잡이 형태가 크게 다른 도구 조합에서는 grasp 실패가 발생할 수 있다. 실험 시 도구 조합별로 grasp 성공 여부를 기록한다.
+- Arm Selection도 원래 도구가 아니라 **실제 slot 기준**으로 결정한다 (Slot 1~4 → LEFT, Slot 5~7 → RIGHT).
 
 ---
 
@@ -635,12 +713,18 @@ SPEECH RECOGNITION
 ↓
 TOOL SELECTION
 ↓
-TRAY SLOT LOOKUP
+TRAY SLOT LOOKUP (expected slot)
+↓
+TRAY SCAN (7개 slot 분류 → actual tray map)
 ↓
 VISUAL VERIFICATION
-├─ Mismatch → STOP / RECHECK
+├─ expected slot = requested tool → 그대로 진행
+├─ Mismatch → actual tray map에서 requested tool의 실제 slot으로 변경
+└─ 어디에도 없음 / confidence 낮음 → STOP / 의사에게 알림
 ↓
-ARM SELECTION
+INSTRUCTION REMAPPING (실제 slot의 원래 도구 이름)
+↓
+ARM SELECTION (실제 slot 기준)
 ↓
 PICK
 ↓
@@ -680,8 +764,9 @@ WAIT
 핵심 문제는:
 
 > **비슷하게 생긴 복강경 수술기구를 잘못 전달하는 오류를 어떻게 줄일 것인가?**
+> **그리고 도구가 잘못 놓여 있어도 요청한 도구를 올바르게 전달할 수 있는가?**
 
-이다.
+이다. 오류를 감지하고 멈추는 것에 그치지 않고, **오류 상황에서도 올바른 도구를 전달하는 것**을 목표로 한다.
 
 ---
 
@@ -694,12 +779,12 @@ Handle Appearance
 +
 Existing Color Band
 +
-Visual Verification
+Visual Verification & Recovery (Tray Scan + Instruction Remapping)
 +
 Learning-Based Manipulation
 ```
 
-을 결합하여 Wrong Tool Selection 및 Wrong Tool Handover를 줄이는 것을 목표로 한다.
+을 결합하여 Wrong Tool Selection 및 Wrong Tool Handover를 줄이고, 도구가 잘못 놓인 상황에서도 올바른 도구를 전달하는 것을 목표로 한다.
 
 ---
 
@@ -732,12 +817,16 @@ Requested Tool
 ↓
 Fixed Slot Prior
 ↓
-Handle Visual Verification
+Tray Scan + Handle Visual Verification
 ↓
-Target Confirmation
+Actual Slot 결정 (Mismatch 시 실제 위치로 변경)
+↓
+Instruction Remapping
 ↓
 ACT / SmolVLA Pick
 ```
+
+Method A와 C는 **동일한 SmolVLA 모델**을 사용하며, 차이는 입력 instruction뿐이다 (A: 요청 도구 이름 그대로, C: 실제 slot 기준으로 remapping된 이름).
 
 ---
 
@@ -788,14 +877,29 @@ Wrong Tool
 ```text
 Scissors 요청
 ↓
-Slot 3
+Tray Scan
 ↓
-Classifier
+Slot 3 = Clipper, Slot 4 = Scissors로 판단
 ↓
-Clipper로 판단
+Instruction = "Pick up the clipper." (Slot 4의 원래 도구)
 ↓
-Pick 중단
+Slot 4에서 Scissors Pick
+↓
+Correct Tool 전달
 ```
+
+Disturbance 조건:
+
+- 두 도구의 위치를 서로 바꾸는 swap (같은 arm 영역 내 / 다른 arm 영역 간)
+- 요청한 도구를 tray에서 제거 → 올바르게 STOP/알림하는지 확인
+
+비교 지표:
+
+| Method | 정상 배치 | Disturbance |
+|---|---|---|
+| A. SmolVLA Only | Correct Tool | Wrong Tool 예상 |
+| B. Fixed Slot | Correct Tool | Wrong Tool |
+| **C. Proposed** | Correct Tool | **Correct Tool** |
 
 ---
 
@@ -832,6 +936,7 @@ Handover
 - Hand Detection Success Rate
 - Handover Success Rate
 - Wrong Tool Handover Rate
+- Disturbance Recovery Rate (잘못 배치된 상황에서 올바른 도구를 전달한 비율)
 - Retrieval Success Rate
 - Correct Return Rate
 - End-to-End Success Rate
@@ -842,11 +947,11 @@ Response Time은 보조 지표로 기록한다.
 
 # 36. 논문 핵심 결과표 예시
 
-| Method | Tool Selection | Wrong Tool | Grasp | Handover | E2E |
-|---|---:|---:|---:|---:|---:|
-| SmolVLA Only | - | - | - | - | - |
-| Fixed Slot | - | - | - | - | - |
-| **Proposed** | **-** | **-** | **-** | **-** | **-** |
+| Method | Tool Selection | Wrong Tool | Disturbance Recovery | Grasp | Handover | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| SmolVLA Only | - | - | - | - | - | - |
+| Fixed Slot | - | - | - | - | - | - |
+| **Proposed** | **-** | **-** | **-** | **-** | **-** | **-** |
 
 ---
 
@@ -879,7 +984,7 @@ Voice → Whisper → Requested Tool → Tray Prior → Visual Verification
 ```text
 (a) SmolVLA Only
 (b) Fixed Slot Only
-(c) Proposed: Fixed Slot + Visual Verification
+(c) Proposed: Fixed Slot + Visual Verification & Recovery
 ```
 
 ---
@@ -899,7 +1004,7 @@ III. Proposed System
    A. System Overview
    B. Voice Command Processing
    C. Tray-Prior Instrument Selection
-   D. Handle-Based Visual Verification
+   D. Handle-Based Visual Verification and Recovery
    E. Dual-Arm Manipulation
    F. Vision-Guided Handover
 
@@ -929,7 +1034,7 @@ STEP 7  왼팔 4개 / 오른팔 3개 역할 분담
 STEP 8  Whisper 연결
 STEP 9  Fixed Tray Slot 연결
 STEP 10 Handle Classifier 학습
-STEP 11 Visual Verification 연결
+STEP 11 Visual Verification & Recovery 연결 (Tray Scan + Instruction Remapping)
 STEP 12 Pick → 90° Rotation
 STEP 13 D415 Hand Detection
 STEP 14 Depth → 3D Hand Position
