@@ -283,6 +283,22 @@ class XLerobot(Robot):
         return self.bus1.is_calibrated and self.bus2.is_calibrated
 
     def calibrate(self) -> None:
+        # connect() may have already started the raw-tty keyboard listener, which
+        # leaves /dev/tty in non-canonical mode and breaks input() below. Restore
+        # normal tty mode for the duration of calibration, then resume it after.
+        _raw_kb_was_running = self._raw_kb._running
+        if _raw_kb_was_running:
+            self._raw_kb.stop()
+        try:
+            self._calibrate_impl()
+        finally:
+            if _raw_kb_was_running:
+                try:
+                    self._raw_kb.start()
+                except Exception as e:
+                    logger.warning(f"Could not restart keyboard listener: {e}")
+
+    def _calibrate_impl(self) -> None:
         logger.info(f"\nRunning calibration of {self}")
         ## calib left motors
         left_motors = self.left_arm_motors + self.head_motors

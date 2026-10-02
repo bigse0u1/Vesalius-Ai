@@ -1,0 +1,997 @@
+# Y-MAS 베살리우스 팀
+## 복강경 수술도구 전달 로봇 Task 1 연구 계획
+
+---
+
+# 1. 연구 목표
+
+본 연구의 목표는 **복강경 수술 환경에서 의사가 요청한 수술도구를 로봇이 정확하게 선택하고, 집어서 의사에게 전달한 뒤 사용이 끝난 도구를 다시 회수하여 제자리에 복귀시키는 robotic scrub assistant를 구현하는 것**이다.
+
+현재 사용하는 플랫폼은 XLeRobot + SO-ARM 계열의 저비용 로봇 시스템이기 때문에, 숙련된 scrub nurse와 전달 속도를 경쟁하기보다는 다음을 우선 목표로 한다.
+
+- 정확한 도구 선택
+- 잘못된 도구 전달 최소화
+- 안정적인 grasp
+- 정확한 handover
+- 사용한 도구의 정확한 회수
+- 높은 End-to-End Success Rate
+
+즉, 연구의 핵심은 **속도보다 정확성과 신뢰성**이다.
+
+---
+
+# 2. 대상 수술도구
+
+현재 사용하는 복강경 수술도구는 총 7종이다.
+
+1. Grasper
+2. Bipolar
+3. Hook
+4. Clipper
+5. Scissors
+6. Irrigator
+7. Specimen Bag
+
+복강경 수술도구는 긴 shaft 부분이 서로 비슷하고, 실제 차이는 distal tip에 있는 경우가 많다. 하지만 로봇의 head camera에서는 tip 부분이 멀리 위치하기 때문에 작은 차이를 안정적으로 구별하기 어렵다.
+
+따라서 본 연구에서는 tip 중심 인식보다는 다음 정보를 활용한다.
+
+- Standardized Tray 위치
+- 손잡이 형태
+- 복강경 기구에 원래 존재하는 color band
+- Robot system state
+
+---
+
+# 3. 전체 시스템 구조
+
+```text
+Surgeon Voice Request
+        ↓
+Speech Recognition
+        ↓
+Requested Tool
+        ↓
+Tray Slot Prior
+        ↓
+Handle Visual Verification
+        ↓
+Arm Selection
+        ↓
+ACT / SmolVLA Pick
+        ↓
+Grasp + Lift
+        ↓
+90° Robot Rotation
+        ↓
+Hand Detection
+        ↓
+Vision-Guided Handover
+        ↓
+Instrument Use
+        ↓
+Return Zone
+        ↓
+Retrieval
+        ↓
+Tray Return
+```
+
+---
+
+# 4. 음성 인식
+
+의사의 음성 요청은 Whisper 계열 모델을 이용해 처리한다.
+
+초기에는 `faster-whisper`를 데스크탑에 설치하여 로컬에서 실행하며, 별도의 Whisper fine-tuning은 우선 수행하지 않는다.
+
+```text
+의사: "Scissors 주세요."
+        ↓
+USB Microphone
+        ↓
+faster-whisper
+        ↓
+"Scissors 주세요."
+        ↓
+Command Parser
+        ↓
+Requested Tool = SCISSORS
+```
+
+동일한 도구에 대해 여러 표현을 하나의 canonical label로 변환한다.
+
+```text
+"가위"
+"시저"
+"Scissors"
+"Scissors 주세요"
+→ SCISSORS
+```
+
+---
+
+# 5. Standardized Tray
+
+7개 도구는 정해진 tray 위치에 배치한다.
+
+```text
+Slot 1 = Grasper
+Slot 2 = Bipolar
+Slot 3 = Hook
+Slot 4 = Clipper
+Slot 5 = Scissors
+Slot 6 = Irrigator
+Slot 7 = Specimen Bag
+```
+
+의사가 특정 도구를 요청하면 먼저 해당 도구의 expected slot을 조회한다.
+
+```text
+Requested Tool = Scissors
+↓
+Scissors = Slot 5
+↓
+Slot 5 접근
+```
+
+이 구조를 이용하면 매번 YOLO로 전체 tray에서 도구 위치를 탐색할 필요가 없다.
+
+---
+
+# 6. Visual Verification
+
+Fixed Slot만 사용할 경우 도구가 잘못 배치되어 있으면 잘못된 도구를 집을 가능성이 있다.
+
+```text
+Database: Slot 5 = Scissors
+실제:     Slot 5 = Clipper
+```
+
+이를 방지하기 위해 **손잡이 기반 Visual Verification**을 추가한다.
+
+---
+
+# 7. 손잡이 기반 도구 분류
+
+복강경 수술도구는 tip보다 손잡이가 head camera에서 더 크게 보인다. 또한 다음 특징을 사용할 수 있다.
+
+```text
+Handle Shape
++
+Existing Color Band
+```
+
+손잡이 영역을 crop한 뒤 Image Classifier에 입력한다.
+
+```text
+Handle ROI
+↓
+Image Classifier
+↓
+Grasper / Bipolar / Hook / Clipper / Scissors / Irrigator / Specimen Bag
+```
+
+예:
+
+```text
+Requested = Scissors
+Predicted = Scissors
+→ Pick 허용
+```
+
+```text
+Requested = Scissors
+Predicted = Clipper
+→ Pick 중단
+→ Error / Recheck
+```
+
+---
+
+# 8. Classifier 후보
+
+초기에는 다음 모델을 비교할 수 있다.
+
+- ResNet18
+- MobileNetV3
+- EfficientNet-B0
+
+Classifier의 역할은 **도구의 위치를 찾는 것**이 아니라 **현재 slot에 있는 도구가 무엇인지 확인하는 것**이다.
+
+---
+
+# 9. YOLO를 우선 사용하지 않는 이유
+
+YOLO는 `무엇인가 + 어디 있는가`를 동시에 해결한다. 하지만 현재 시스템은 standardized tray를 사용하므로 도구 위치를 이미 알고 있다.
+
+따라서 현재 단계에서는:
+
+```text
+Fixed Slot
++
+Classifier Verification
+```
+
+이 더 단순하다.
+
+향후 도구 위치를 랜덤하게 배치하는 실험으로 확장할 경우 YOLO 또는 YOLO-OBB를 사용할 수 있다.
+
+---
+
+# 10. Pick Manipulation
+
+도구를 실제로 집는 동작은 imitation learning으로 학습한다.
+
+후보:
+
+- ACT
+- SmolVLA
+
+리더암을 이용해 사람이 demonstration을 수집한다.
+
+---
+
+# 11. Pick Demonstration
+
+한 Pick episode는 다음과 같이 구성한다.
+
+```text
+Home Pose
+↓
+Target Tool 접근
+↓
+Gripper Open
+↓
+Grasp Position 접근
+↓
+Gripper Close
+↓
+Lift
+↓
+Ready Pose
+```
+
+저장 데이터:
+
+```text
+Head Camera RGB
+Wrist Camera RGB
+Robot Joint State
+Gripper State
+Robot Action
+Task Instruction
+Timestamp
+```
+
+SmolVLA 사용 시 instruction 예:
+
+```text
+"Pick up the scissors."
+```
+
+---
+
+# 12. SmolVLA의 역할
+
+```text
+Camera
++
+Robot State
++
+Language Instruction
+↓
+SmolVLA
+↓
+Robot Action
+```
+
+SmolVLA의 주요 역할은 **도구에 어떻게 접근하고 잡을 것인가**이다.
+
+본 연구에서는 도구 identity의 신뢰성을 높이기 위해 tray prior와 classifier를 추가로 사용한다.
+
+---
+
+# 13. ACT와 SmolVLA 비교
+
+실제 수술도구 데이터 수집 전에 3색 블록으로 pipeline을 먼저 검증한다.
+
+```text
+Red Block / Blue Block / Green Block
+```
+
+Task:
+
+```text
+Pick
+↓
+Lift
+↓
+90° Rotation
+↓
+Place
+```
+
+비교:
+
+```text
+ACT vs SmolVLA
+```
+
+평가:
+
+- Pick Success
+- Position Generalization
+- End-to-End Success
+- 안정성
+
+---
+
+# 14. 수술도구 Pick 데이터 수집량
+
+## Pilot
+
+```text
+도구당 20~30 demonstrations
+7개 → 총 140~210 episodes
+```
+
+## Main Dataset
+
+```text
+도구당 80~100 demonstrations
+7개 → 총 560~700 episodes
+```
+
+---
+
+# 15. 데이터 Variation
+
+같은 위치에서 반복만 하지 않고 다음 variation을 포함한다.
+
+- 고정 위치: 약 20회
+- 좌우/앞뒤 위치 변화: 약 20회
+- 도구 각도 변화: 약 20회
+- 조명/카메라 변화: 약 10~20회
+- 접근 경로 및 grasp pose 변화: 약 10~20회
+
+단, grasp strategy 자체는 지나치게 제각각이지 않도록 일관성을 유지한다.
+
+---
+
+# 16. Dual-Arm 역할 분담
+
+```text
+Left Arm  → 왼쪽 4개 도구
+Right Arm → 오른쪽 3개 도구
+```
+
+예시 mapping:
+
+```text
+Grasper       → LEFT
+Bipolar       → LEFT
+Hook          → LEFT
+Clipper       → LEFT
+Scissors      → RIGHT
+Irrigator     → RIGHT
+Specimen Bag  → RIGHT
+```
+
+실제 tray 배치에 따라 mapping은 변경 가능하다.
+
+---
+
+# 17. 어느 팔이 도구를 들고 있는지 관리
+
+이 정보는 AI가 추론하게 하지 않고 시스템 state로 직접 관리한다.
+
+```text
+active_arm = LEFT
+held_tool = CLIPPER
+```
+
+Pick 성공 후 상태를 저장한다.
+
+```text
+Pick Success
+↓
+active_arm 저장
+held_tool 저장
+↓
+90° Rotation
+↓
+해당 arm으로 Handover
+```
+
+따라서 이를 별도로 학습할 필요는 없다.
+
+---
+
+# 18. 90° 회전
+
+Pick 이후 의사 방향으로 약 90° 회전한다. 이 동작은 imitation learning으로 학습하지 않고 IMU와 base controller를 이용한다.
+
+```text
+Pick Success
+↓
+Current Yaw
+↓
+Target Yaw = Current + 90°
+↓
+Base Rotation
+↓
+IMU Feedback
+↓
+Target Angle 도달
+↓
+Stop
+```
+
+---
+
+# 19. Hand Detection
+
+90° 회전 후 의사가 손을 내밀면 D415로 손을 검출한다.
+
+후보:
+
+- MediaPipe Hands
+- YOLO-based Hand Detector
+
+```text
+D415 RGB
+↓
+Hand Detector
+↓
+Hand Pixel Position (u, v)
+```
+
+---
+
+# 20. D415 Depth를 이용한 3D 위치
+
+```text
+Hand Pixel (u, v)
++
+Depth
+↓
+3D Hand Position (X, Y, Z)
+```
+
+이 정보를 robot coordinate system으로 변환한다.
+
+---
+
+# 21. Handover
+
+현재 계획에서는 Handover를 별도로 imitation learning하지 않는다.
+
+```text
+Hand Detection
++
+Depth
++
+Geometry
++
+Robot Control
+```
+
+전체 흐름:
+
+```text
+D415
+↓
+MediaPipe / YOLO
+↓
+Hand Position
+↓
+Depth
+↓
+3D Hand Position
+↓
+Safety Offset
+↓
+Handover Target Pose
+↓
+IK / Cartesian Control
+↓
+Robot Move
+↓
+Release
+```
+
+즉:
+
+> **Pick은 learning-based manipulation**
+> **Handover는 vision-guided control**
+
+구조이다.
+
+---
+
+# 22. Handover Safety Offset
+
+손 중심으로 직접 이동하지 않고 collision 방지를 위해 offset을 둔다.
+
+```text
+Handover Target
+=
+Hand Position
++
+Safety Offset
+```
+
+실제 offset 값은 실험을 통해 결정한다.
+
+---
+
+# 23. Release
+
+초기에는 rule-based 방식으로 구현한다.
+
+```text
+Handover Position 도달
+↓
+손이 일정 거리 안에 존재
+↓
+Robot Stop
+↓
+짧게 대기
+↓
+Gripper Open
+```
+
+---
+
+# 24. Handover Policy는 현재 사용하지 않음
+
+Handover Policy는 로봇이 도구를 잡은 상태에서 사람 손에 접근하고 전달하는 행동 자체를 demonstration으로 학습하는 방식이다.
+
+현재 Task 1에서는 다음처럼 단순화한다.
+
+```text
+Pick      → ACT / SmolVLA
+Handover  → Hand Detection + Depth + Control
+```
+
+---
+
+# 25. 도구 회수
+
+초기에는 의사 손에서 직접 다시 받지 않고 Return Zone을 사용한다.
+
+```text
+Surgeon Uses Instrument
+↓
+Return Zone에 도구 배치
+↓
+Robot Retrieval
+```
+
+---
+
+# 26. Return 및 Tray 복귀
+
+Robot은 이미 다음 상태를 알고 있다.
+
+```text
+held_tool
+home_slot
+active_arm
+```
+
+예:
+
+```text
+held_tool = Scissors
+home_slot = Slot 5
+```
+
+따라서:
+
+```text
+Return Zone
+↓
+Tool Retrieval
+↓
+-90° Rotation
+↓
+Slot 5
+↓
+Place
+```
+
+가 가능하다.
+
+---
+
+# 27. 반환 시 Visual Verification
+
+정확성을 높이기 위해 반환된 도구를 classifier로 다시 확인하는 것을 optional verification layer로 둘 수 있다.
+
+```text
+Retrieved Tool
+↓
+Handle Camera Image
+↓
+Classifier
+↓
+Detected Tool
+↓
+Expected Tool과 비교
+```
+
+---
+
+# 28. 최종 State Machine
+
+```text
+WAIT
+↓
+VOICE REQUEST
+↓
+SPEECH RECOGNITION
+↓
+TOOL SELECTION
+↓
+TRAY SLOT LOOKUP
+↓
+VISUAL VERIFICATION
+├─ Mismatch → STOP / RECHECK
+↓
+ARM SELECTION
+↓
+PICK
+↓
+GRASP CHECK
+↓
+SAVE active_arm / held_tool
+↓
+ROTATE +90°
+↓
+HAND DETECTION
+↓
+3D HAND POSITION
+↓
+VISION-GUIDED HANDOVER
+↓
+RELEASE
+↓
+WAIT FOR USE
+↓
+RETURN ZONE
+↓
+RETRIEVAL
+↓
+ROTATE -90°
+↓
+TRAY RETURN
+↓
+WAIT
+```
+
+---
+
+# 29. 논문의 핵심 문제
+
+단순히 **"SmolVLA로 수술도구를 집어서 전달한다."**를 contribution으로 하지 않는다.
+
+핵심 문제는:
+
+> **비슷하게 생긴 복강경 수술기구를 잘못 전달하는 오류를 어떻게 줄일 것인가?**
+
+이다.
+
+---
+
+# 30. 제안하는 핵심 아이디어
+
+```text
+Standardized Tray Prior
++
+Handle Appearance
++
+Existing Color Band
++
+Visual Verification
++
+Learning-Based Manipulation
+```
+
+을 결합하여 Wrong Tool Selection 및 Wrong Tool Handover를 줄이는 것을 목표로 한다.
+
+---
+
+# 31. 논문용 비교 방법
+
+## Method A — SmolVLA Only
+
+```text
+Camera + Language Instruction
+↓
+SmolVLA
+↓
+Direct Pick
+```
+
+## Method B — Fixed Slot Only
+
+```text
+Requested Tool
+↓
+Fixed Slot
+↓
+Pick
+```
+
+## Method C — Proposed
+
+```text
+Requested Tool
+↓
+Fixed Slot Prior
+↓
+Handle Visual Verification
+↓
+Target Confirmation
+↓
+ACT / SmolVLA Pick
+```
+
+---
+
+# 32. 핵심 실험 1 — Tool Classification
+
+질문:
+
+> 손잡이와 기존 color band를 이용해 7개 도구를 얼마나 정확하게 구별할 수 있는가?
+
+| Input | Accuracy |
+|---|---:|
+| Handle Shape | 측정 |
+| Color Band | 측정 |
+| Handle + Color Band | 측정 |
+
+추가 평가:
+
+- Confusion Matrix
+- Precision
+- Recall
+- F1-score
+
+---
+
+# 33. 핵심 실험 2 — Wrong-Slot Disturbance
+
+일부러 도구 위치를 바꿔놓는다.
+
+```text
+정상:       Slot 5 = Scissors
+Disturbance: Slot 5 = Clipper
+```
+
+Fixed Slot 방식:
+
+```text
+Scissors 요청
+↓
+Slot 5
+↓
+Clipper Pick
+↓
+Wrong Tool
+```
+
+제안 방법:
+
+```text
+Scissors 요청
+↓
+Slot 5
+↓
+Classifier
+↓
+Clipper로 판단
+↓
+Pick 중단
+```
+
+---
+
+# 34. 핵심 실험 3 — End-to-End Handover
+
+```text
+Voice
+↓
+Tool Selection
+↓
+Verification
+↓
+Pick
+↓
+90° Rotation
+↓
+Hand Detection
+↓
+Handover
+```
+
+7개 도구 × 20 trials = **140 autonomous trials**를 목표로 한다.
+
+---
+
+# 35. 평가 지표
+
+- Speech Recognition Accuracy
+- Tool Classification Accuracy
+- Correct Tool Selection Rate
+- Wrong Tool Selection Rate
+- Grasp Success Rate
+- Rotation Success Rate
+- Hand Detection Success Rate
+- Handover Success Rate
+- Wrong Tool Handover Rate
+- Retrieval Success Rate
+- Correct Return Rate
+- End-to-End Success Rate
+
+Response Time은 보조 지표로 기록한다.
+
+---
+
+# 36. 논문 핵심 결과표 예시
+
+| Method | Tool Selection | Wrong Tool | Grasp | Handover | E2E |
+|---|---:|---:|---:|---:|---:|
+| SmolVLA Only | - | - | - | - | - |
+| Fixed Slot | - | - | - | - | - |
+| **Proposed** | **-** | **-** | **-** | **-** | **-** |
+
+---
+
+# 37. Figure 구성
+
+## Figure 1 — Experimental Setup
+
+- XLeRobot
+- Instrument Tray
+- D415
+- Wrist Cameras
+- 7 laparoscopic instruments
+- Surgeon
+- Handover Area
+- Return Zone
+
+## Figure 2 — Overall System Pipeline
+
+```text
+Voice → Whisper → Requested Tool → Tray Prior → Visual Verification
+→ ACT / SmolVLA → Pick → 90° Rotation → Hand Detection → Handover → Return
+```
+
+## Figure 3 — Handle-Based Verification
+
+7개 도구의 손잡이와 color band를 표시한다.
+
+## Figure 4 — Method Comparison
+
+```text
+(a) SmolVLA Only
+(b) Fixed Slot Only
+(c) Proposed: Fixed Slot + Visual Verification
+```
+
+---
+
+# 38. ICEIC 논문 목차
+
+```text
+Abstract
+
+I. Introduction
+
+II. Related Work
+   A. Robotic Scrub Nurse
+   B. Surgical Instrument Recognition
+
+III. Proposed System
+   A. System Overview
+   B. Voice Command Processing
+   C. Tray-Prior Instrument Selection
+   D. Handle-Based Visual Verification
+   E. Dual-Arm Manipulation
+   F. Vision-Guided Handover
+
+IV. Experiments
+   A. Experimental Setup
+   B. Instrument Classification
+   C. Wrong-Slot Disturbance Test
+   D. End-to-End Handover
+
+V. Discussion
+
+VI. Conclusion
+```
+
+---
+
+# 39. 개발 순서
+
+```text
+STEP 1  3색 블록 Pick
+STEP 2  ACT / SmolVLA 학습 pipeline 확인
+STEP 3  3색 블록 Pick → 90° Rotate → Place
+STEP 4  실제 수술도구 2개 Pick
+STEP 5  수술도구 4개
+STEP 6  수술도구 7개
+STEP 7  왼팔 4개 / 오른팔 3개 역할 분담
+STEP 8  Whisper 연결
+STEP 9  Fixed Tray Slot 연결
+STEP 10 Handle Classifier 학습
+STEP 11 Visual Verification 연결
+STEP 12 Pick → 90° Rotation
+STEP 13 D415 Hand Detection
+STEP 14 Depth → 3D Hand Position
+STEP 15 Vision-Guided Handover
+STEP 16 Return Zone
+STEP 17 Tool Retrieval
+STEP 18 Tray Return
+STEP 19 Wrong-Slot Disturbance Experiment
+STEP 20 End-to-End Evaluation
+```
+
+---
+
+# 40. 최종 연구 메시지
+
+본 연구는 단순히 **"VLA를 이용해 수술도구를 집는 로봇"**을 목표로 하지 않는다.
+
+최종적으로는:
+
+> **Standardized tray의 위치 정보와 복강경 수술도구 손잡이의 시각적 특징 및 기존 color band를 이용한 visual verification을 결합하여, 잘못된 도구 전달을 줄이는 신뢰성 중심의 robotic scrub assistant**
+
+를 목표로 한다.
+
+핵심은 다음과 같다.
+
+```text
+빠른 수술도구 전달                 X
+
+정확한 수술도구 선택               O
+Wrong-Tool Handover 최소화         O
+안정적인 Grasp                     O
+Vision-Guided Handover             O
+```
+
+---
+
+# 41. 향후 Task 2
+
+Task 1 이후에는 현재 manipulation system을 그대로 사용하면서 상위-level intelligence를 추가한다.
+
+```text
+Surgical Video
+↓
+Surgical Phase Recognition
+↓
+Next Tool Prediction
+↓
+Predictive Preparation
+↓
+Task 1 Manipulation System
+↓
+Handover
+```
+
+최종적으로:
+
+```text
+Reactive Robotic Scrub Assistant
+↓
+Context-Aware Assistant
+↓
+Predictive Robotic Scrub Nurse
+```
+
+로 확장한다.

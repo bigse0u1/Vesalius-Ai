@@ -6,7 +6,7 @@ import zmq
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QGroupBox, QPushButton, QLineEdit, QFormLayout, QScrollArea,
-    QProgressBar
+    QProgressBar, QTabWidget
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QPalette, QColor
@@ -32,6 +32,32 @@ try:
     LEROBOT_OK = True
 except ImportError:
     LEROBOT_OK = False
+
+try:
+    from faster_whisper import WhisperModel
+    import sounddevice as sd
+    WHISPER_OK = True
+except ImportError:
+    WHISPER_OK = False
+
+TOOL_ALIASES = {
+    "GRASPER": ["grasper", "그라스퍼", "그래스퍼"],
+    "BIPOLAR": ["bipolar", "바이폴라"],
+    "HOOK": ["hook", "훅"],
+    "CLIPPER": ["clipper", "클리퍼"],
+    "SCISSORS": ["scissors", "scissor", "시저", "가위"],
+    "IRRIGATOR": ["irrigator", "이리게이터", "석션"],
+    "SPECIMEN_BAG": ["specimen bag", "스페시먼백", "스페시먼 백", "백"],
+}
+
+
+def _to_canonical_tool(text):
+    t = text.lower()
+    for canonical, aliases in TOOL_ALIASES.items():
+        for alias in aliases:
+            if alias.lower() in t:
+                return canonical
+    return None
 
 
 ARM_KEYS_L = ["left_arm_shoulder_pan", "left_arm_shoulder_lift", "left_arm_elbow_flex",
@@ -63,6 +89,21 @@ DATASET_FEATURES = {
 }
 
 
+def _obs_to_locked_action(obs):
+    """Build a holdable scripted action from an observation's arm state.
+
+    observation.*.gripper.pos is the raw motor reading, but xlerobot.py's
+    send_action() inverts gripper actions (100 - value) before writing to the
+    motor. So replaying a state reading verbatim as an action flips the
+    gripper open/closed; it must be re-inverted here to actually hold position.
+    """
+    pose = {k: obs.get(k, 0.0) or 0.0 for k in STATE_KEYS if k.startswith(("left_arm", "right_arm"))}
+    for gkey in ("left_arm_gripper.pos", "right_arm_gripper.pos"):
+        if gkey in pose:
+            pose[gkey] = 100.0 - pose[gkey]
+    return pose
+
+
 def _decode_b64_image(b64):
     if not b64:
         return None
@@ -79,6 +120,7 @@ class Signals(QObject):
     status_changed = pyqtSignal(str)
     upload_done    = pyqtSignal(bool, str)
     policy_loaded  = pyqtSignal(bool, str)
+    voice_done     = pyqtSignal(bool, str, str)
 
 
 class ControlThread(threading.Thread):
@@ -99,6 +141,7 @@ class ControlThread(threading.Thread):
         self.postprocessor = None
         self.device = None
         self.ai_task = ""
+        self.scripted_action = None
 
     def set_head(self, pan, tilt):
         with self._lock:
@@ -168,7 +211,9 @@ class ControlThread(threading.Thread):
                     except zmq.Again:
                         pass
 
-                    if self.ai_mode and self.policy is not None:
+                    if self.scripted_action is not None:
+                        action = dict(self.scripted_action)
+                    elif self.ai_mode and self.policy is not None:
                         action = self._infer_action()
                         if action is None:
                             time.sleep(1/60)
@@ -348,6 +393,7 @@ class MainWindow(QMainWindow):
         self.signals.status_changed.connect(lambda m: self.statusBar().showMessage(m))
         self.signals.upload_done.connect(self._on_upload_done)
         self.signals.policy_loaded.connect(self._on_policy_loaded)
+        self.signals.voice_done.connect(self._on_voice_done)
         self.ctrl = None
         self.policy = None
         self.preprocessor = None
@@ -368,22 +414,40 @@ class MainWindow(QMainWindow):
         self.dataset = None
         self.recording = False
         self.episode_count = 0
+        self.whisper_model = None
+        self._voice_recording = False
+        self._voice_chunks = []
+        self._voice_stream = None
+        self.auto_rotate_active = False
+        self.auto_rotate_target = 0.0
+        self._demo_token = 0
+        self._handoff_pose_path = os.path.expanduser("~/xlerobot-teleop/desktop/handoff_pose.json")
         self._build_ui()
         t = QTimer(self); t.timeout.connect(self._tick); t.start(50)
         self.setFocusPolicy(Qt.StrongFocus)
 
+    def _tab_page(self):
+        """New scrollable tab-page (widget, layout) pair, styled to match the sidebar."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea{border:none; background:#161b22;}")
+        page = QWidget(); page.setStyleSheet("background:#161b22;")
+        layout = QVBoxLayout(page); layout.setContentsMargins(8,8,8,8); layout.setSpacing(8)
+        scroll.setWidget(page)
+        return scroll, layout
+
     def _build_ui(self):
         root = QWidget(); self.setCentralWidget(root)
         rl = QHBoxLayout(root); rl.setSpacing(6); rl.setContentsMargins(6,6,6,6)
+        tab_style = ("QTabWidget::pane{border:none;background:#161b22;}"
+                     "QTabBar::tab{background:#21262d;color:#8b949e;padding:6px 12px;}"
+                     "QTabBar::tab:selected{background:#161b22;color:#58a6ff;font-weight:bold;}")
 
-        # ── 왼쪽 사이드바 ─────────────────────────
-        scroll_l = QScrollArea()
-        scroll_l.setFixedWidth(270)
-        scroll_l.setWidgetResizable(True)
-        scroll_l.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_l.setStyleSheet("QScrollArea{border:none; background:#161b22;}")
-        sb = QWidget(); sb.setStyleSheet("background:#161b22;")
-        sl = QVBoxLayout(sb); sl.setContentsMargins(8,8,8,8); sl.setSpacing(8)
+        # ── 왼쪽: 탭 (조종 / AI 모드) ───────────────
+        tabs_l = QTabWidget(); tabs_l.setFixedWidth(280); tabs_l.setStyleSheet(tab_style)
+
+        ctrl_scroll, sl = self._tab_page()
 
         # 연결 설정
         cg = QGroupBox("연결 설정"); cg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
@@ -435,12 +499,16 @@ class MainWindow(QMainWindow):
             l = QLabel("—"); l.setStyleSheet("color:#7ee787;font-family:monospace;font-size:11px;")
             afl.addRow(short+":", l); self.arm_lbls[key] = l
         sl.addWidget(ag)
+        sl.addStretch()
+        tabs_l.addTab(ctrl_scroll, "조종")
+
+        ai_scroll, aifl_outer = self._tab_page()
+        sl = aifl_outer  # subsequent widgets below go into the AI 모드 tab
 
         # AI 추론
         aig = QGroupBox("AI 추론 (실험적)"); aig.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
         aifl = QVBoxLayout(aig); aifl.setSpacing(4)
-        default_ckpt = os.path.expanduser(
-            "~/lerobot/outputs/train/act_test10/checkpoints/last/pretrained_model")
+        default_ckpt = "/home/taekyeung/lerobot/outputs/train/smolvla_2tool/checkpoints/last/pretrained_model"
         self.f_policy_path = QLineEdit(default_ckpt)
         self.f_ai_task = QLineEdit("Pick up the block")
         aifl.addWidget(QLabel("체크포인트 경로:")); aifl.addWidget(self.f_policy_path)
@@ -458,10 +526,52 @@ class MainWindow(QMainWindow):
         self.l_ai_status.setStyleSheet("color:#8b949e;font-size:11px;")
         self.l_ai_status.setWordWrap(True)
         aifl.addWidget(self.l_ai_status)
+        self.btn_voice = QPushButton("🎤 음성 명령 듣기")
+        self.btn_voice.setStyleSheet("QPushButton{background:#9e6a03;color:white;padding:6px;border-radius:4px;}")
+        self.btn_voice.clicked.connect(self._toggle_voice_record)
+        aifl.addWidget(self.btn_voice)
+        self.l_voice_status = QLabel("")
+        self.l_voice_status.setStyleSheet("color:#8b949e;font-size:11px;")
+        self.l_voice_status.setWordWrap(True)
+        aifl.addWidget(self.l_voice_status)
         sl.addWidget(aig)
+
+        # 데모 시퀀스
+        dg = QGroupBox("데모 시퀀스"); dg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
+        dfl = QVBoxLayout(dg); dfl.setSpacing(4)
+        rot_row = QHBoxLayout()
+        self.f_rotate_target = QLineEdit("-90")
+        self.f_rotate_target.setFixedWidth(50)
+        rot_row.addWidget(QLabel("목표 각도:")); rot_row.addWidget(self.f_rotate_target)
+        dfl.addLayout(rot_row)
+        self.btn_auto_rotate = QPushButton("자동 회전 시작")
+        self.btn_auto_rotate.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}")
+        self.btn_auto_rotate.clicked.connect(self._start_auto_rotate)
+        dfl.addWidget(self.btn_auto_rotate)
+        self.btn_save_handoff = QPushButton("핸드오프 자세 저장")
+        self.btn_save_handoff.setStyleSheet("QPushButton{background:#6e7681;color:white;padding:6px;border-radius:4px;}")
+        self.btn_save_handoff.clicked.connect(self._save_handoff_pose)
+        dfl.addWidget(self.btn_save_handoff)
+        self.btn_run_handoff = QPushButton("핸드오프 동작 실행")
+        self.btn_run_handoff.setStyleSheet("QPushButton{background:#6e7681;color:white;padding:6px;border-radius:4px;}")
+        self.btn_run_handoff.clicked.connect(lambda: self._run_handoff())
+        dfl.addWidget(self.btn_run_handoff)
+        self.btn_demo = QPushButton("▶ 전체 데모 시작")
+        self.btn_demo.setStyleSheet("QPushButton{background:#da3633;color:white;padding:8px;border-radius:4px;font-weight:bold;}")
+        self.btn_demo.clicked.connect(lambda: self._start_demo_sequence())
+        dfl.addWidget(self.btn_demo)
+        self.btn_estop = QPushButton("🛑 긴급 정지")
+        self.btn_estop.setStyleSheet("QPushButton{background:#67060c;color:white;padding:10px;border-radius:4px;font-weight:bold;font-size:13px;}QPushButton:hover{background:#8b1118;}")
+        self.btn_estop.clicked.connect(self._emergency_stop)
+        dfl.addWidget(self.btn_estop)
+        self.l_demo_status = QLabel("")
+        self.l_demo_status.setStyleSheet("color:#8b949e;font-size:11px;")
+        self.l_demo_status.setWordWrap(True)
+        dfl.addWidget(self.l_demo_status)
+        sl.addWidget(dg)
         sl.addStretch()
-        scroll_l.setWidget(sb)
-        rl.addWidget(scroll_l)
+        tabs_l.addTab(ai_scroll, "AI 모드")
+        rl.addWidget(tabs_l)
 
         # ── 가운데 카메라 ──────────────────────────
         cp = QWidget(); cl = QVBoxLayout(cp); cl.setSpacing(6)
@@ -474,20 +584,16 @@ class MainWindow(QMainWindow):
         cl.addLayout(wr, stretch=1)
         rl.addWidget(cp, stretch=1)
 
-        # ── 오른쪽 패널 ───────────────────────────
-        scroll_r = QScrollArea()
-        scroll_r.setFixedWidth(290)
-        scroll_r.setWidgetResizable(True)
-        scroll_r.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_r.setStyleSheet("QScrollArea{border:none; background:#161b22;}")
-        rb = QWidget(); rb.setStyleSheet("background:#161b22;")
-        rl2 = QVBoxLayout(rb); rl2.setContentsMargins(8,8,8,8); rl2.setSpacing(8)
+        # ── 오른쪽: 탭 (데이터 / 상태) ──────────────
+        tabs_r = QTabWidget(); tabs_r.setFixedWidth(300); tabs_r.setStyleSheet(tab_style)
+
+        data_scroll, rl2 = self._tab_page()
 
         # 데이터 녹화
         rg = QGroupBox("데이터 녹화"); rg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
         rfl = QVBoxLayout(rg); rfl.setSpacing(4)
-        self.f_repo = QLineEdit("bigse0u1/xlerobot_1block_test10")
-        self.f_task = QLineEdit("Pick up the block")
+        self.f_repo = QLineEdit("bigse0u1/xlerobot_2tool_pilot")
+        self.f_task = QLineEdit("Pick up the grasper")
         rfl.addWidget(QLabel("Repo ID:")); rfl.addWidget(self.f_repo)
         rfl.addWidget(QLabel("Task 설명:")); rfl.addWidget(self.f_task)
         self.btn_dataset = QPushButton("데이터셋 생성")
@@ -513,6 +619,10 @@ class MainWindow(QMainWindow):
         self.btn_upload.clicked.connect(self._upload_dataset)
         rfl.addWidget(self.btn_upload)
         rl2.addWidget(rg)
+        rl2.addStretch()
+        tabs_r.addTab(data_scroll, "데이터")
+
+        status_scroll, rl2 = self._tab_page()
 
         # IMU
         ig = QGroupBox("IMU"); ig.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
@@ -560,9 +670,8 @@ class MainWindow(QMainWindow):
             self.robot_viz = None
         rl2.addWidget(vg)
         rl2.addStretch()
-
-        scroll_r.setWidget(rb)
-        rl.addWidget(scroll_r)
+        tabs_r.addTab(status_scroll, "상태")
+        rl.addWidget(tabs_r)
 
         self.statusBar().showMessage("연결 안 됨")
 
@@ -572,6 +681,237 @@ class MainWindow(QMainWindow):
         self._calibrating = True
         self._calib_samples = []
         self.imu_yaw.setText("Yaw: 캘리브레이션 중... (가만히 있으세요)")
+
+    def _toggle_voice_record(self):
+        if not WHISPER_OK:
+            self.l_voice_status.setText("faster-whisper/sounddevice 설치 필요")
+            return
+        if not self._voice_recording:
+            self._voice_chunks = []
+            self._voice_recording = True
+            self.btn_voice.setText("■ 녹음 중지 (다시 클릭)")
+            self.l_voice_status.setText("듣는 중...")
+
+            def _cb(indata, frames, time_info, status):
+                self._voice_chunks.append(indata.copy())
+
+            try:
+                self._voice_stream = sd.InputStream(samplerate=16000, channels=1, dtype="float32", callback=_cb)
+                self._voice_stream.start()
+            except Exception as e:
+                self._voice_recording = False
+                self.l_voice_status.setText(f"마이크 열기 실패: {e}")
+                self.btn_voice.setText("🎤 음성 명령 듣기")
+        else:
+            self._voice_recording = False
+            self.btn_voice.setText("🎤 음성 명령 듣기")
+            self.l_voice_status.setText("인식 중...")
+            try:
+                self._voice_stream.stop(); self._voice_stream.close()
+            except Exception:
+                pass
+            audio = (np.concatenate(self._voice_chunks, axis=0).flatten()
+                     if self._voice_chunks else np.zeros(0, dtype=np.float32))
+            threading.Thread(target=self._do_transcribe, args=(audio,), daemon=True).start()
+
+    def _do_transcribe(self, audio):
+        try:
+            if audio.size < 16000 * 0.3:
+                self.signals.voice_done.emit(False, "너무 짧습니다", "")
+                return
+            if self.whisper_model is None:
+                self.whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+            segments, info = self.whisper_model.transcribe(audio, language=None, beam_size=5)
+            text = "".join(seg.text for seg in segments).strip()
+            canonical = _to_canonical_tool(text)
+            self.signals.voice_done.emit(canonical is not None, text, canonical or "")
+        except Exception as e:
+            self.signals.voice_done.emit(False, f"인식 실패: {e}", "")
+
+    def _on_voice_done(self, ok, text, canonical):
+        if ok:
+            task = f"Pick up the {canonical.lower().replace('_', ' ')}"
+            self.f_ai_task.setText(task)
+            self.l_voice_status.setText(f'"{text}" → {canonical} → 데모 시퀀스 시작')
+            self._start_demo_sequence()
+        else:
+            self.l_voice_status.setText(f'매칭 실패: "{text}"')
+
+    def _start_auto_rotate(self):
+        if not self.ctrl or not self.ctrl.running:
+            self.statusBar().showMessage("먼저 로봇에 연결하세요")
+            return
+        try:
+            self.auto_rotate_target = float(self.f_rotate_target.text())
+        except ValueError:
+            self.statusBar().showMessage("목표 각도가 숫자가 아님")
+            return
+        self._demo_token += 1
+        token = self._demo_token
+        # 회전 중 팔이 흔들리지 않도록 지금 자세를 그대로 고정한 채 회전한다.
+        obs = self.ctrl._latest_obs or {}
+        lock_pose = _obs_to_locked_action(obs)
+        self.ctrl.scripted_action = lock_pose
+        self.auto_rotate_active = True
+        self.l_demo_status.setText(f"자동 회전 중... 목표 {self.auto_rotate_target}° (현재 자세 고정)")
+
+        def _wait_done():
+            if token != self._demo_token:
+                return
+            if self.auto_rotate_active:
+                QTimer.singleShot(200, _wait_done)
+                return
+            if self.ctrl:
+                self.ctrl.scripted_action = None
+            self.l_demo_status.setText(f"자동 회전 완료 (yaw={self._yaw:.1f}°)")
+
+        QTimer.singleShot(200, _wait_done)
+
+    def _save_handoff_pose(self):
+        obs = self.ctrl._latest_obs if self.ctrl else None
+        if not obs:
+            self.statusBar().showMessage("관측 데이터 없음 (연결 확인)")
+            return
+        pose = _obs_to_locked_action(obs)
+        try:
+            with open(self._handoff_pose_path, "w") as f:
+                json.dump(pose, f, indent=2)
+            self.statusBar().showMessage(f"핸드오프 자세 저장됨: {self._handoff_pose_path}")
+        except Exception as e:
+            self.statusBar().showMessage(f"저장 실패: {e}")
+
+    def _get_arm_pos_vec(self):
+        obs = self.ctrl._latest_obs if self.ctrl else None
+        if not obs:
+            return None
+        return [obs.get(k, 0.0) or 0.0 for k in STATE_KEYS if k.startswith(("left_arm", "right_arm"))]
+
+    def _wait_for_settle(self, token, get_vec_fn, on_settled,
+                          stable_checks=4, interval_ms=300, max_wait_s=20.0, eps=1.0, min_wait_s=3.0):
+        """Polls get_vec_fn() until consecutive readings stop changing (or times out).
+
+        min_wait_s guards against mistaking a brief mid-sequence pause (e.g. the
+        policy pausing before closing the gripper) for the pick being finished.
+        """
+        state = {"prev": None, "stable": 0, "elapsed": 0.0}
+
+        def _check():
+            if token != self._demo_token:
+                return  # sequence was cancelled/superseded
+            state["elapsed"] += interval_ms / 1000.0
+            cur = get_vec_fn()
+            if cur is not None and state["prev"] is not None and len(cur) == len(state["prev"]):
+                delta = max(abs(a - b) for a, b in zip(cur, state["prev"]))
+                state["stable"] = state["stable"] + 1 if delta < eps else 0
+            state["prev"] = cur
+            past_min_wait = state["elapsed"] >= min_wait_s
+            if (past_min_wait and state["stable"] >= stable_checks) or state["elapsed"] >= max_wait_s:
+                on_settled()
+                return
+            QTimer.singleShot(interval_ms, _check)
+
+        QTimer.singleShot(interval_ms, _check)
+
+    def _run_handoff(self, move_duration_s=2.5, hold_s=3.0, release_s=1.0, token=None, on_done=None):
+        if not self.ctrl or not self.ctrl.running:
+            self.statusBar().showMessage("먼저 로봇에 연결하세요")
+            return
+        try:
+            with open(self._handoff_pose_path) as f:
+                pose = json.load(f)
+        except Exception as e:
+            self.statusBar().showMessage(f"핸드오프 자세 로드 실패: {e} (먼저 '핸드오프 자세 저장' 필요)")
+            return
+        self.ctrl.scripted_action = dict(pose)
+        self.l_demo_status.setText("핸드오프: 이동 중...")
+
+        def _cancelled():
+            return token is not None and token != self._demo_token
+
+        def _arrived():
+            if _cancelled():
+                return
+            self.l_demo_status.setText("핸드오프: 도착, 대기 중...")
+            QTimer.singleShot(int(hold_s * 1000), _release)
+
+        def _release():
+            if _cancelled():
+                return
+            release_pose = dict(pose)
+            for gkey in ("left_arm_gripper.pos", "right_arm_gripper.pos"):
+                if gkey in release_pose:
+                    release_pose[gkey] = 100.0 if release_pose[gkey] < 50.0 else 0.0
+            self.ctrl.scripted_action = release_pose
+            self.l_demo_status.setText("핸드오프: 놓는 중...")
+            QTimer.singleShot(int(release_s * 1000), _finish)
+
+        def _finish():
+            if _cancelled():
+                return
+            if self.ctrl:
+                self.ctrl.scripted_action = None
+            self.l_demo_status.setText("핸드오프 완료")
+            if on_done:
+                on_done()
+
+        QTimer.singleShot(int(move_duration_s * 1000), _arrived)
+
+    def _start_demo_sequence(self, grip_lock_s=1.0):
+        if not self.ctrl or not self.ctrl.running:
+            self.statusBar().showMessage("먼저 로봇에 연결하세요")
+            return
+        if not self.policy:
+            self.statusBar().showMessage("먼저 정책을 로드하세요")
+            return
+        self._demo_token += 1
+        token = self._demo_token
+        self.l_demo_status.setText("1/4 집는 중... (움직임이 멈출 때까지 대기)")
+        if not self.ctrl.ai_mode:
+            self._toggle_ai_mode()
+
+        def _on_pick_settled():
+            if token != self._demo_token:
+                return
+            self.ctrl.ai_mode = False
+            self.btn_ai_mode.setText("AI 모드 시작")
+            self.btn_ai_mode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+            self.l_demo_status.setText("2/4 자세 고정 중...")
+            # 현재(잡은 직후) 팔 자세를 그대로 고정해서 회전 중 도구를 놓치지 않게 한다.
+            obs = self.ctrl._latest_obs or {}
+            lock_pose = _obs_to_locked_action(obs)
+            self.ctrl.scripted_action = lock_pose
+            QTimer.singleShot(int(grip_lock_s * 1000), _start_rotate)
+
+        def _start_rotate():
+            if token != self._demo_token:
+                return
+            self.l_demo_status.setText("3/4 회전 중...")
+            self.auto_rotate_target = float(self.f_rotate_target.text() or -90)
+            self.auto_rotate_active = True
+            QTimer.singleShot(200, _wait_rotate)
+
+        def _wait_rotate():
+            if token != self._demo_token:
+                return
+            if self.auto_rotate_active:
+                QTimer.singleShot(200, _wait_rotate)
+                return
+            self.l_demo_status.setText("4/4 핸드오프 중...")
+            self._run_handoff(token=token, on_done=lambda: self.l_demo_status.setText("데모 완료 ✓"))
+
+        self._wait_for_settle(token, self._get_arm_pos_vec, _on_pick_settled)
+
+    def _emergency_stop(self):
+        self._demo_token += 1  # invalidate any pending demo-sequence callbacks
+        self.auto_rotate_active = False
+        if self.ctrl:
+            self.ctrl.ai_mode = False
+            self.ctrl.scripted_action = None
+            self.ctrl.set_wheels(0.0, 0.0, 0.0)
+        self.btn_ai_mode.setText("AI 모드 시작")
+        self.btn_ai_mode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+        self.l_demo_status.setText("🛑 긴급 정지됨")
+        self.statusBar().showMessage("긴급 정지: AI/회전/스크립트 동작 모두 중단")
 
     def _toggle_dataset(self):
         if self.dataset is None:
@@ -829,12 +1169,20 @@ class MainWindow(QMainWindow):
         self.l_tilt.setText(f"{self.head_tilt:.1f}")
         self.l_spd.setText(f"{self.SPD:.2f}")
         x = y = t = 0.0
-        if Qt.Key_I in pk: x =  self.SPD
-        if Qt.Key_K in pk: x = -self.SPD
-        if Qt.Key_J in pk: y =  self.SPD
-        if Qt.Key_L in pk: y = -self.SPD
-        if Qt.Key_U in pk: t =  self.THETA
-        if Qt.Key_O in pk: t = -self.THETA
+        if self.auto_rotate_active:
+            err = self.auto_rotate_target - self._yaw
+            if abs(err) < 2.0:
+                self.auto_rotate_active = False
+                self.l_demo_status.setText(f"자동 회전 완료 (yaw={self._yaw:.1f}°)")
+            else:
+                t = self.THETA if err > 0 else -self.THETA
+        else:
+            if Qt.Key_I in pk: x =  self.SPD
+            if Qt.Key_K in pk: x = -self.SPD
+            if Qt.Key_J in pk: y =  self.SPD
+            if Qt.Key_L in pk: y = -self.SPD
+            if Qt.Key_U in pk: t =  self.THETA
+            if Qt.Key_O in pk: t = -self.THETA
         if self.ctrl and self.ctrl.running:
             self.ctrl.set_head(self.head_pan, self.head_tilt)
             self.ctrl.set_wheels(x, y, t)
