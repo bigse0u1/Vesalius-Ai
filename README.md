@@ -22,7 +22,7 @@ This is the manipulation/teleop layer for the **Y-MAS 베살리우스 팀** lapa
 - Live per-motor temperature readout (14 motors: both arms + head)
 - Embedded 3D robot pose visualization (matplotlib, simplified forward kinematics)
 - Tabbed control GUI (조종 / AI 모드 on the left, 데이터 / 상태 on the right) instead of one long scrolling sidebar
-- One-click dataset recording (LeRobotDataset) for imitation learning — episode start/save/discard, resumable across sessions, background upload to Hugging Face
+- One-click dataset recording (LeRobotDataset) for imitation learning — separate Pick and Place (tray return) datasets, episode start/save/discard, resumable across sessions, background upload to Hugging Face
 - Ready for **ACT** / **SmolVLA** training via `lerobot-train`
 - Experimental **AI 모드**: run a trained checkpoint directly on the robot from the control GUI (no separate eval script needed)
 - **Voice-triggered demo sequence**: Whisper recognizes a spoken tool name → auto-fills the task prompt → runs the full pick → grip-lock → auto-rotate → handoff sequence, with a manual "▶ 전체 데모 시작" button and a "🛑 긴급 정지" kill switch
@@ -251,13 +251,28 @@ The right panel's **모터 온도** section polls `Present_Temperature` on all 1
 
 ## Data Recording (for ACT / SmolVLA training)
 
-The right panel's **데이터 녹화** section records demonstrations directly into a [LeRobotDataset](https://github.com/huggingface/lerobot):
+The right panel's **데이터** tab has two independent recording sections, each writing to its own [LeRobotDataset](https://github.com/huggingface/lerobot):
+
+| Section | Default Repo ID | Default Task | What to demonstrate |
+|---|---|---|---|
+| **데이터 녹화 — Pick** | `bigse0u1/xlerobot_scrub_7tool` | `Pick up the grasper` | Home pose → grasp the tool from its tray slot → lift → ready pose |
+| **데이터 녹화 — Place (반납)** | `bigse0u1/xlerobot_scrub_7tool_place` | `Place the grasper back in the tray` | Start from the ready pose *already holding* the tool → put it back in its slot → release → home pose |
+
+Each section works the same way:
 
 1. Set **Repo ID** (e.g. `<hf_user>/<task_name>`) and **Task 설명**.
 2. Click **데이터셋 생성** — creates a new dataset, or resumes an existing one if the Repo ID already has data (safe to stop and continue later, e.g. after a motor cooldown).
 3. Click **● 에피소드 녹화 시작**, perform the demonstration with the leader arms, then **■ 에피소드 저장**. Use **현재 에피소드 폐기** to discard a bad take before saving.
 4. Repeat for ~50+ episodes (see [LeRobot's data collection guide](https://github.com/huggingface/lerobot) for tips: vary object position/color, keep demonstrations consistent).
-5. Click **데이터셋 종료** when done for the session, then **허깅페이스 업로드** to push to the Hub (optional, runs in the background).
+5. When done for the session, click **허깅페이스 업로드** to push to the Hub (optional, runs in the background). Upload finalizes the dataset, so recording is disabled afterwards — reopen the GUI and click **데이터셋 생성** with the same Repo ID to continue. Use **데이터셋 종료** to close a session without uploading.
+
+Both datasets can be open at the same time, but only **one episode records at a time** — starting an episode in one section while the other is recording is refused. This makes the natural loop *Pick 저장 → Place 녹화 시작 → put it back → Place 저장* quick, since the tool is already in the gripper at the end of each Pick episode.
+
+Tips for Place data:
+
+- Keep the starting state consistent (ready pose, tool held) — at run time Place starts right after retrieval, holding the tool.
+- Use one fixed phrasing per tool (e.g. `Place the scissors back in the tray`). With the fixed tray layout, the tool name implies its home slot, matching the tray-return step in the research plan (§26).
+- Use the same arm split as Pick (Slot 1–4 → left arm, Slot 5–7 → right arm).
 
 > After recording a batch, it's worth sanity-checking that the saved `action` values actually vary across a trajectory (`ds[i]['action']` for a few frames of one episode) before spending an hour training on them — a silent all-zero `action` column (frozen policy at eval time) is the single easiest way to waste a training run.
 

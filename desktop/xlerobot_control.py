@@ -41,13 +41,13 @@ except ImportError:
     WHISPER_OK = False
 
 TOOL_ALIASES = {
-    "GRASPER": ["grasper", "그라스퍼", "그래스퍼"],
-    "BIPOLAR": ["bipolar", "바이폴라"],
+    "GRASPER": ["grasper", "그라스퍼", "그래스퍼", "그리스포","Grispo"],
+    "BIPOLAR": ["bipolar", "바이폴라", "바이플라"],
     "HOOK": ["hook", "훅"],
     "CLIPPER": ["clipper", "클리퍼"],
     "SCISSORS": ["scissors", "scissor", "시저", "가위"],
-    "IRRIGATOR": ["irrigator", "이리게이터", "석션"],
-    "SPECIMEN_BAG": ["specimen bag", "스페시먼백", "스페시먼 백", "백"],
+    "IRRIGATOR": ["irrigator", "이리게이터", "이리게이터", "석션"],
+    "SPECIMEN_BAG": ["specimen bag", "스페시먼백", "스페시먼 백", "백", "bag", "back"]
 }
 
 
@@ -118,7 +118,6 @@ def _decode_b64_image(b64):
 class Signals(QObject):
     obs_received   = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
-    upload_done    = pyqtSignal(bool, str)
     policy_loaded  = pyqtSignal(bool, str)
     voice_done     = pyqtSignal(bool, str, str)
 
@@ -383,6 +382,173 @@ class CamLabel(QLabel):
         except: pass
 
 
+class DatasetRecorder(QGroupBox):
+    """LeRobotDataset 녹화 패널 하나 (Repo ID / Task / 에피소드 / 업로드).
+
+    Pick, Place 등 데이터셋마다 하나씩 만들어 독립적으로 녹화한다.
+    is_busy()가 True면 (다른 패널이 녹화 중) 새 에피소드를 시작하지 않는다.
+    """
+    upload_done = pyqtSignal(bool, str)
+
+    def __init__(self, title, repo_id, task, status, is_busy):
+        super().__init__(title)
+        self.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
+        self._status = status
+        self._is_busy = is_busy
+        self.dataset = None
+        self.recording = False
+        self.episode_count = 0
+        self.upload_done.connect(self._on_upload_done)
+
+        rfl = QVBoxLayout(self); rfl.setSpacing(4)
+        self.f_repo = QLineEdit(repo_id)
+        self.f_task = QLineEdit(task)
+        rfl.addWidget(QLabel("Repo ID:")); rfl.addWidget(self.f_repo)
+        rfl.addWidget(QLabel("Task 설명:")); rfl.addWidget(self.f_task)
+        self.btn_dataset = QPushButton("데이터셋 생성")
+        self.btn_dataset.setStyleSheet("QPushButton{background:#238636;color:white;padding:6px;border-radius:4px;}")
+        self.btn_dataset.clicked.connect(self._toggle_dataset)
+        rfl.addWidget(self.btn_dataset)
+        self.btn_episode = QPushButton("● 에피소드 녹화 시작")
+        self.btn_episode.setEnabled(False)
+        self.btn_episode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+        self.btn_episode.clicked.connect(self._toggle_episode)
+        rfl.addWidget(self.btn_episode)
+        self.btn_discard = QPushButton("현재 에피소드 폐기")
+        self.btn_discard.setEnabled(False)
+        self.btn_discard.setStyleSheet("QPushButton{background:#da3633;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+        self.btn_discard.clicked.connect(self._discard_episode)
+        rfl.addWidget(self.btn_discard)
+        self.l_episode_count = QLabel("녹화된 에피소드: 0")
+        self.l_episode_count.setStyleSheet("color:#7ee787;font-family:monospace;")
+        rfl.addWidget(self.l_episode_count)
+        self.btn_upload = QPushButton("허깅페이스 업로드")
+        self.btn_upload.setEnabled(False)
+        self.btn_upload.setStyleSheet("QPushButton{background:#8957e5;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
+        self.btn_upload.clicked.connect(self._upload_dataset)
+        rfl.addWidget(self.btn_upload)
+
+    def task(self):
+        return self.f_task.text()
+
+    def add_frame(self, frame):
+        if self.dataset is None or not self.recording or frame is None:
+            return
+        try:
+            self.dataset.add_frame(frame)
+        except Exception as e:
+            self._status(f"프레임 기록 실패: {e}")
+
+    def _toggle_dataset(self):
+        if self.dataset is None:
+            if not LEROBOT_OK:
+                self._status("lerobot 데이터셋 모듈을 불러올 수 없음")
+                return
+            repo_id = self.f_repo.text()
+            existing = (HF_LEROBOT_HOME / repo_id).exists()
+            try:
+                if existing:
+                    self.dataset = LeRobotDataset.resume(
+                        repo_id=repo_id,
+                        root=HF_LEROBOT_HOME / repo_id,
+                        image_writer_threads=4,
+                    )
+                    self.episode_count = self.dataset.meta.total_episodes
+                    msg = f"기존 데이터셋 이어서 녹화: {repo_id} (기존 {self.episode_count}개)"
+                else:
+                    self.dataset = LeRobotDataset.create(
+                        repo_id=repo_id,
+                        fps=30,
+                        features=DATASET_FEATURES,
+                        robot_type="xlerobot",
+                        use_videos=True,
+                        image_writer_threads=4,
+                    )
+                    self.episode_count = 0
+                    msg = f"데이터셋 생성됨: {repo_id}"
+                self.l_episode_count.setText(f"녹화된 에피소드: {self.episode_count}")
+                self.btn_dataset.setText("데이터셋 종료")
+                self.btn_episode.setEnabled(True)
+                self.btn_upload.setEnabled(True)
+                self.f_repo.setEnabled(False)
+                self._status(msg)
+            except Exception as e:
+                self._status(f"데이터셋 열기 실패: {e}")
+        else:
+            if self.recording:
+                self._toggle_episode()
+            self.dataset = None
+            self.btn_dataset.setText("데이터셋 생성")
+            self.btn_episode.setEnabled(False)
+            self.btn_discard.setEnabled(False)
+            self.btn_upload.setEnabled(False)
+            self.f_repo.setEnabled(True)
+            self._status("데이터셋 세션 종료")
+
+    def _toggle_episode(self):
+        if self.dataset is None:
+            return
+        if not self.recording:
+            if self._is_busy():
+                self._status("다른 데이터셋이 녹화 중 — 먼저 저장/폐기하세요")
+                return
+            self.recording = True
+            self.btn_episode.setText("■ 에피소드 저장")
+            self.btn_discard.setEnabled(True)
+            self._status(f"녹화 중... ({self.title()})")
+        else:
+            self.recording = False
+            try:
+                self.dataset.save_episode()
+                self.episode_count += 1
+                self.l_episode_count.setText(f"녹화된 에피소드: {self.episode_count}")
+                self._status(f"에피소드 {self.episode_count} 저장됨 ({self.title()})")
+            except Exception as e:
+                self._status(f"저장 실패: {e}")
+            self.btn_episode.setText("● 에피소드 녹화 시작")
+            self.btn_discard.setEnabled(False)
+
+    def _discard_episode(self):
+        if self.dataset is None or not self.recording:
+            return
+        try:
+            self.dataset.clear_episode_buffer()
+        except Exception:
+            pass
+        self.recording = False
+        self.btn_episode.setText("● 에피소드 녹화 시작")
+        self.btn_discard.setEnabled(False)
+        self._status("에피소드 폐기됨")
+
+    def discard_on_close(self):
+        if self.dataset is not None and self.recording:
+            try: self.dataset.clear_episode_buffer()
+            except Exception: pass
+
+    def _upload_dataset(self):
+        if self.dataset is None or self.recording:
+            return
+        self.btn_upload.setEnabled(False)
+        self.btn_episode.setEnabled(False)
+        self.btn_discard.setEnabled(False)
+        self._status("허깅페이스 업로드 중... (에피소드 수에 따라 수 분 소요)")
+        dataset = self.dataset
+
+        def _do_upload():
+            try:
+                dataset.finalize()
+                dataset.push_to_hub()
+                self.upload_done.emit(True, "허깅페이스 업로드 완료 ✓")
+            except Exception as e:
+                self.upload_done.emit(False, f"업로드 실패: {e}")
+
+        threading.Thread(target=_do_upload, daemon=True).start()
+
+    def _on_upload_done(self, ok, msg):
+        self._status(msg)
+        self.btn_upload.setEnabled(not ok)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -391,7 +557,6 @@ class MainWindow(QMainWindow):
         self.signals = Signals()
         self.signals.obs_received.connect(self._on_obs)
         self.signals.status_changed.connect(lambda m: self.statusBar().showMessage(m))
-        self.signals.upload_done.connect(self._on_upload_done)
         self.signals.policy_loaded.connect(self._on_policy_loaded)
         self.signals.voice_done.connect(self._on_voice_done)
         self.ctrl = None
@@ -411,9 +576,6 @@ class MainWindow(QMainWindow):
         self._calib_samples = []
         self._arm_joints = {'left': [0.0]*6, 'right': [0.0]*6}
         self._viz_counter = 0
-        self.dataset = None
-        self.recording = False
-        self.episode_count = 0
         self.whisper_model = None
         self._voice_recording = False
         self._voice_chunks = []
@@ -589,36 +751,18 @@ class MainWindow(QMainWindow):
 
         data_scroll, rl2 = self._tab_page()
 
-        # 데이터 녹화
-        rg = QGroupBox("데이터 녹화"); rg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
-        rfl = QVBoxLayout(rg); rfl.setSpacing(4)
-        self.f_repo = QLineEdit("bigse0u1/xlerobot_scrub_7tool")
-        self.f_task = QLineEdit("Pick up the grasper")
-        rfl.addWidget(QLabel("Repo ID:")); rfl.addWidget(self.f_repo)
-        rfl.addWidget(QLabel("Task 설명:")); rfl.addWidget(self.f_task)
-        self.btn_dataset = QPushButton("데이터셋 생성")
-        self.btn_dataset.setStyleSheet("QPushButton{background:#238636;color:white;padding:6px;border-radius:4px;}")
-        self.btn_dataset.clicked.connect(self._toggle_dataset)
-        rfl.addWidget(self.btn_dataset)
-        self.btn_episode = QPushButton("● 에피소드 녹화 시작")
-        self.btn_episode.setEnabled(False)
-        self.btn_episode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
-        self.btn_episode.clicked.connect(self._toggle_episode)
-        rfl.addWidget(self.btn_episode)
-        self.btn_discard = QPushButton("현재 에피소드 폐기")
-        self.btn_discard.setEnabled(False)
-        self.btn_discard.setStyleSheet("QPushButton{background:#da3633;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
-        self.btn_discard.clicked.connect(self._discard_episode)
-        rfl.addWidget(self.btn_discard)
-        self.l_episode_count = QLabel("녹화된 에피소드: 0")
-        self.l_episode_count.setStyleSheet("color:#7ee787;font-family:monospace;")
-        rfl.addWidget(self.l_episode_count)
-        self.btn_upload = QPushButton("허깅페이스 업로드")
-        self.btn_upload.setEnabled(False)
-        self.btn_upload.setStyleSheet("QPushButton{background:#8957e5;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
-        self.btn_upload.clicked.connect(self._upload_dataset)
-        rfl.addWidget(self.btn_upload)
-        rl2.addWidget(rg)
+        # 데이터 녹화 (Pick / Place 데이터셋을 따로 녹화, 한 번에 하나만 녹화)
+        status = lambda m: self.statusBar().showMessage(m)
+        self.rec_pick = DatasetRecorder(
+            "데이터 녹화 — Pick", "bigse0u1/xlerobot_scrub_7tool", "Pick up the grasper",
+            status, lambda: self.rec_place.recording)
+        self.rec_place = DatasetRecorder(
+            "데이터 녹화 — Place (반납)", "bigse0u1/xlerobot_scrub_7tool_place",
+            "Place the grasper back in the tray",
+            status, lambda: self.rec_pick.recording)
+        self.recorders = [self.rec_pick, self.rec_place]
+        rl2.addWidget(self.rec_pick)
+        rl2.addWidget(self.rec_place)
         rl2.addStretch()
         tabs_r.addTab(data_scroll, "데이터")
 
@@ -913,107 +1057,6 @@ class MainWindow(QMainWindow):
         self.l_demo_status.setText("🛑 긴급 정지됨")
         self.statusBar().showMessage("긴급 정지: AI/회전/스크립트 동작 모두 중단")
 
-    def _toggle_dataset(self):
-        if self.dataset is None:
-            if not LEROBOT_OK:
-                self.statusBar().showMessage("lerobot 데이터셋 모듈을 불러올 수 없음")
-                return
-            repo_id = self.f_repo.text()
-            existing = (HF_LEROBOT_HOME / repo_id).exists()
-            try:
-                if existing:
-                    self.dataset = LeRobotDataset.resume(
-                        repo_id=repo_id,
-                        root=HF_LEROBOT_HOME / repo_id,
-                        image_writer_threads=4,
-                    )
-                    self.episode_count = self.dataset.meta.total_episodes
-                    msg = f"기존 데이터셋 이어서 녹화: {repo_id} (기존 {self.episode_count}개)"
-                else:
-                    self.dataset = LeRobotDataset.create(
-                        repo_id=repo_id,
-                        fps=30,
-                        features=DATASET_FEATURES,
-                        robot_type="xlerobot",
-                        use_videos=True,
-                        image_writer_threads=4,
-                    )
-                    self.episode_count = 0
-                    msg = f"데이터셋 생성됨: {repo_id}"
-                self.l_episode_count.setText(f"녹화된 에피소드: {self.episode_count}")
-                self.btn_dataset.setText("데이터셋 종료")
-                self.btn_episode.setEnabled(True)
-                self.btn_upload.setEnabled(True)
-                self.f_repo.setEnabled(False)
-                self.statusBar().showMessage(msg)
-            except Exception as e:
-                self.statusBar().showMessage(f"데이터셋 열기 실패: {e}")
-        else:
-            if self.recording:
-                self._toggle_episode()
-            self.dataset = None
-            self.btn_dataset.setText("데이터셋 생성")
-            self.btn_episode.setEnabled(False)
-            self.btn_discard.setEnabled(False)
-            self.btn_upload.setEnabled(False)
-            self.f_repo.setEnabled(True)
-            self.statusBar().showMessage("데이터셋 세션 종료")
-
-    def _toggle_episode(self):
-        if self.dataset is None:
-            return
-        if not self.recording:
-            self.recording = True
-            self.btn_episode.setText("■ 에피소드 저장")
-            self.btn_discard.setEnabled(True)
-            self.statusBar().showMessage("녹화 중...")
-        else:
-            self.recording = False
-            try:
-                self.dataset.save_episode()
-                self.episode_count += 1
-                self.l_episode_count.setText(f"녹화된 에피소드: {self.episode_count}")
-                self.statusBar().showMessage(f"에피소드 {self.episode_count} 저장됨")
-            except Exception as e:
-                self.statusBar().showMessage(f"저장 실패: {e}")
-            self.btn_episode.setText("● 에피소드 녹화 시작")
-            self.btn_discard.setEnabled(False)
-
-    def _discard_episode(self):
-        if self.dataset is None or not self.recording:
-            return
-        try:
-            self.dataset.clear_episode_buffer()
-        except Exception:
-            pass
-        self.recording = False
-        self.btn_episode.setText("● 에피소드 녹화 시작")
-        self.btn_discard.setEnabled(False)
-        self.statusBar().showMessage("에피소드 폐기됨")
-
-    def _upload_dataset(self):
-        if self.dataset is None or self.recording:
-            return
-        self.btn_upload.setEnabled(False)
-        self.btn_episode.setEnabled(False)
-        self.btn_discard.setEnabled(False)
-        self.statusBar().showMessage("허깅페이스 업로드 중... (에피소드 수에 따라 수 분 소요)")
-        dataset = self.dataset
-
-        def _do_upload():
-            try:
-                dataset.finalize()
-                dataset.push_to_hub()
-                self.signals.upload_done.emit(True, "허깅페이스 업로드 완료 ✓")
-            except Exception as e:
-                self.signals.upload_done.emit(False, f"업로드 실패: {e}")
-
-        threading.Thread(target=_do_upload, daemon=True).start()
-
-    def _on_upload_done(self, ok, msg):
-        self.statusBar().showMessage(msg)
-        self.btn_upload.setEnabled(not ok)
-
     def _load_policy(self):
         if not LEROBOT_OK:
             self.l_ai_status.setText("lerobot 정책 모듈을 불러올 수 없음")
@@ -1065,7 +1108,7 @@ class MainWindow(QMainWindow):
             self.btn_ai_mode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
             self.statusBar().showMessage("AI 모드 중지, 리더암 제어로 복귀")
 
-    def _capture_frame(self, obs):
+    def _capture_frame(self, obs, task):
         head_img = _decode_b64_image(obs.get("head", ""))
         left_img = _decode_b64_image(obs.get("left_wrist", ""))
         right_img = _decode_b64_image(obs.get("right_wrist", ""))
@@ -1080,7 +1123,7 @@ class MainWindow(QMainWindow):
             "observation.images.right_wrist": right_img,
             "observation.state": state,
             "action": action,
-            "task": self.f_task.text(),
+            "task": task,
         }
 
     def _toggle(self):
@@ -1119,13 +1162,9 @@ class MainWindow(QMainWindow):
             self.robot_viz.update_pose(lj, rj)
 
         # 데이터 녹화
-        if self.dataset is not None and self.recording:
-            frame = self._capture_frame(obs)
-            if frame is not None:
-                try:
-                    self.dataset.add_frame(frame)
-                except Exception as e:
-                    self.statusBar().showMessage(f"프레임 기록 실패: {e}")
+        for rec in self.recorders:
+            if rec.recording:
+                rec.add_frame(self._capture_frame(obs, rec.task()))
 
         # 모터 온도
         self.temp_panel.update_temps(obs)
@@ -1189,10 +1228,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         if self.ctrl: self.ctrl.stop()
-        if self.dataset is not None:
-            if self.recording:
-                try: self.dataset.clear_episode_buffer()
-                except Exception: pass
+        for rec in self.recorders:
+            rec.discard_on_close()
         e.accept()
 
 
