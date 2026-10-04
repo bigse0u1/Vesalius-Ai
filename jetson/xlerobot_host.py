@@ -92,8 +92,10 @@ class XLerobotHost:
         self.max_loop_freq_hz = config.max_loop_freq_hz
 
     def disconnect(self):
-        self.zmq_observation_socket.close()
-        self.zmq_cmd_socket.close()
+        # linger=0: 보내지 못한 observation이 남아 있어도 기다리지 않고 바로 닫음
+        # (기본값은 무한 대기라 클라이언트가 먼저 끊기면 term()에서 멈춤)
+        self.zmq_observation_socket.close(linger=0)
+        self.zmq_cmd_socket.close(linger=0)
         self.zmq_context.term()
 
 

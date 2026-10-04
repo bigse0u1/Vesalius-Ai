@@ -1139,6 +1139,9 @@ class MainWindow(QMainWindow):
                        obs_port=self.f_obs.text(), left_port=self.f_lport.text(),
                        right_port=self.f_rport.text(), teleop_id=self.f_tid.text())
             self.ctrl = ControlThread(self.signals, cfg)
+            # 첫 명령부터 GUI의 헤드 기본값을 보내도록 미리 설정 (안 하면 _tick이 돌기 전
+            # 몇 프레임 동안 (0, 0)이 전송되어 고개가 들렸다가 다시 내려감)
+            self.ctrl.set_head(self.head_pan, self.head_tilt)
             self.ctrl.start()
             self.btn.setText("연결 끊기")
             self.btn.setStyleSheet("QPushButton{background:#da3633;color:white;padding:8px;border-radius:4px;font-weight:bold;}")
