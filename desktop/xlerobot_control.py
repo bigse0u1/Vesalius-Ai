@@ -50,6 +50,18 @@ TOOL_ALIASES = {
     "SPECIMEN_BAG": ["specimen bag", "스페시먼백", "스페시먼 백", "백", "bag", "back"]
 }
 
+# Canonical label -> tool name exactly as used in the recorded task strings
+# ("Pick up the <name>"). Must match the dataset, e.g. Clipper was recorded as "clippers".
+TOOL_TASK_NAMES = {
+    "GRASPER": "grasper",
+    "BIPOLAR": "bipolar",
+    "HOOK": "hook",
+    "CLIPPER": "clippers",
+    "SCISSORS": "scissors",
+    "IRRIGATOR": "irrigator",
+    "SPECIMEN_BAG": "specimen bag",
+}
+
 
 def _to_canonical_tool(text):
     t = text.lower()
@@ -754,11 +766,11 @@ class MainWindow(QMainWindow):
         # 데이터 녹화 (Pick / Place 데이터셋을 따로 녹화, 한 번에 하나만 녹화)
         status = lambda m: self.statusBar().showMessage(m)
         self.rec_pick = DatasetRecorder(
-            "데이터 녹화 — Pick", "bigse0u1/xlerobot_scrub_7tool", "Pick up the grasper",
+            "데이터 녹화 — Pick", "bigse0u1/xlerobot_scrub_7tool", "Pick up the specimen bag",
             status, lambda: self.rec_place.recording)
         self.rec_place = DatasetRecorder(
             "데이터 녹화 — Place (반납)", "bigse0u1/xlerobot_scrub_7tool_place",
-            "Place the grasper back in the tray",
+            "Place the specimen bag back in the tray",
             status, lambda: self.rec_pick.recording)
         self.recorders = [self.rec_pick, self.rec_place]
         rl2.addWidget(self.rec_pick)
@@ -874,7 +886,7 @@ class MainWindow(QMainWindow):
 
     def _on_voice_done(self, ok, text, canonical):
         if ok:
-            task = f"Pick up the {canonical.lower().replace('_', ' ')}"
+            task = f"Pick up the {TOOL_TASK_NAMES[canonical]}"
             self.f_ai_task.setText(task)
             self.l_voice_status.setText(f'"{text}" → {canonical} → 데모 시퀀스 시작')
             self._start_demo_sequence()

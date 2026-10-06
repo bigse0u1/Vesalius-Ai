@@ -290,7 +290,38 @@ lerobot-train \
   --policy.repo_id=<hf_user>/act_<task_name>
 ```
 
-Swap `--policy.type=act` for `smolvla` to try a language-conditioned VLA instead. See `lerobot-train --help` and the [LeRobot docs](https://github.com/huggingface/lerobot) for more options.
+See `lerobot-train --help` and the [LeRobot docs](https://github.com/huggingface/lerobot) for more options.
+
+#### SmolVLA (7-tool, cloud GPU)
+
+For SmolVLA, **always fine-tune from the pretrained `lerobot/smolvla_base`** with `--policy.path`. Using `--policy.type=smolvla` instead leaves `load_vlm_weights=False` together with `train_expert_only=True`, which means the vision-language backbone is randomly initialized *and* frozen — the policy can't really see or read the instruction (this is how the 2-tool model was trained; see Known Issues).
+
+`smolvla_base` expects camera inputs named `camera1/2/3`, so map ours with `--rename_map`. The map is saved into the checkpoint's `policy_preprocessor.json`, so the GUI's AI 모드 can keep feeding `observation.images.head` etc. without code changes.
+
+Command used for the 7-tool Pick dataset (700 episodes, 246,851 frames) on a RunPod RTX 5090 (32GB):
+
+```bash
+lerobot-train \
+  --policy.path=lerobot/smolvla_base \
+  --dataset.repo_id=bigse0u1/xlerobot_scrub_7tool \
+  --policy.device=cuda \
+  --policy.push_to_hub=true \
+  --policy.repo_id=bigse0u1/smolvla_7tool \
+  --rename_map='{"observation.images.head":"observation.images.camera1","observation.images.left_wrist":"observation.images.camera2","observation.images.right_wrist":"observation.images.camera3"}' \
+  --batch_size=64 \
+  --steps=30000 \
+  --save_freq=5000 \
+  --log_freq=100 \
+  --num_workers=4 \
+  --wandb.enable=false \
+  --output_dir=/workspace/outputs/smolvla_7tool \
+  --job_name=smolvla_7tool
+```
+
+- batch 64 × 30,000 steps ≈ 8 epochs over 246k frames.
+- RunPod setup: pick a PyTorch template with **CUDA 12.8+** (required for RTX 50-series / Blackwell), put `HF_HOME=/workspace/hf` on the persistent volume, `apt-get install -y ffmpeg tmux`, `pip install -e ".[smolvla]"` in a lerobot clone, then `hf auth login`. Check `torch.cuda.is_available()` after installing lerobot — pip can swap in a PyTorch build without Blackwell support.
+- Run inside `tmux` so a dropped SSH session doesn't kill training. If the `data_s` time in the logs is large, raise `--num_workers` (video decoding is CPU-bound).
+- Confirm the model is on the Hub before terminating the pod, then on the desktop: `hf download bigse0u1/smolvla_7tool --local-dir ~/lerobot/outputs/train/smolvla_7tool/pretrained_model`.
 
 ## AI Inference Mode (run a trained policy on the robot)
 
@@ -305,7 +336,7 @@ The **AI 모드** tab (left side) loads a trained checkpoint and lets it drive b
 
 Below AI 추론, the **데모 시퀀스** group chains a full "grab the tool and hand it to the surgeon" run:
 
-1. **🎤 음성 명령 듣기** — click to start recording, click again to stop; Whisper transcribes and matches it against `TOOL_ALIASES`, auto-filling **Task 설명** (e.g. `Pick up the grasper`) and immediately kicking off the full sequence below. Or trigger it manually with **▶ 전체 데모 시작** after setting Task 설명 yourself.
+1. **🎤 음성 명령 듣기** — click to start recording, click again to stop; Whisper transcribes and matches it against `TOOL_ALIASES`, auto-filling **Task 설명** (e.g. `Pick up the grasper`) and immediately kicking off the full sequence below. The tool name in the prompt comes from `TOOL_TASK_NAMES`, which must match the recorded task strings exactly (e.g. Clipper was recorded as `Pick up the clippers`) — update it if you record with different wording. Or trigger it manually with **▶ 전체 데모 시작** after setting Task 설명 yourself.
 2. **Pick** — runs AI 모드 and waits for the arm to *settle* (joint positions stop changing for ~1.2s, with a 3s minimum before it's allowed to declare "done" and a 20s timeout) rather than using a fixed timer, so it doesn't cut the policy off mid-grasp.
 3. **Grip lock** — freezes the arm at its current (just-settled) pose as a `scripted_action`, overriding both AI mode and leader-arm input, so the tool can't be dropped or bumped by stray teleop input during the turn.
 4. **Rotate** — spins the base to **목표 각도** (default `-90`) using IMU yaw feedback, with the grip lock held throughout.
@@ -339,6 +370,7 @@ Press `ENTER`, say a tool name (Korean or English), press `ENTER` again to stop,
 - `faster-whisper` needs its own cuBLAS to use `device="cuda"`; `whisper_test.py` and the GUI's voice command both default to CPU to sidestep this
 - Gripper state↔action inversion (see the ⚠️ note in Demo Sequence above) — any new code that round-trips an observed gripper position back into an action must re-apply `100 - value`
 - `lerobot-calibrate` calls `robot.connect()` (which starts the background raw-tty keyboard listener for i/j/k/l wheel teleop) before calling `robot.calibrate()`, leaving the terminal in non-canonical mode and making `calibrate()`'s `input()` prompts raise `EOFError` immediately — happens even with a direct keyboard/monitor on the Jetson, not just over SSH. Fixed in `xlerobot.py`'s `calibrate()`, which now stops the keyboard listener for the duration of calibration and restarts it afterward.
+- The 2-tool SmolVLA checkpoint (`smolvla_2tool`) was trained with `--policy.type=smolvla`, i.e. `load_vlm_weights=False` + `train_expert_only=True` — a randomly initialized, frozen vision-language backbone. This is a likely major cause of it ignoring the language instruction (next item). The 7-tool run fine-tunes from `lerobot/smolvla_base` instead (see Training)
 - SmolVLA fine-tuned on a small (~100 episodes/tool), visually-cluttered scene (7 similar tools together) tends to ignore the language instruction and just grab whatever's nearest rather than the requested tool — language grounding needs either much more data, or (for now) a **fixed tool layout per recording session** rather than randomizing position every episode, since with limited data the model can't reliably learn both position-invariance and language-based tool selection at once
 - Same-color gripper and tool (e.g. both white) removes a cheap visual cue the policy could otherwise use for fine alignment — no software fix for this (augmentation can't invent contrast that isn't in the pixels); mark the gripper fingers with contrasting tape before the next recording round
 - The settle-detection used to decide when AI 모드 has "finished" picking (`_wait_for_settle`) can mistake a brief mid-sequence pause (e.g. before the gripper closes) for completion; a `min_wait_s=3.0` floor guards against the most obvious case, but this is a timing heuristic, not a grasp-success check — there's no classifier yet confirming the grasp actually succeeded (see Research Plan Progress below)
@@ -353,8 +385,8 @@ Status against the STEP 1–20 development order in [`docs/research_plan.md`](do
 | 2 | ACT / SmolVLA 학습 pipeline 확인 | ✅ Done — both trained end-to-end via `lerobot-train` |
 | 3 | 3색 블록 Pick → 90° Rotate → Place | ✅ Rotate/grip-lock/release mechanism built generically (works for any tool, not block-specific) |
 | 4 | 실제 수술도구 2개 Pick | ✅ Done — Grasper + Scissors, SmolVLA, 110 episodes |
-| 5 | 수술도구 4개 | ⬜ Not started |
-| 6 | 수술도구 7개 | ⬜ Not started |
+| 5 | 수술도구 4개 | ⏭️ Skipped — went straight to 7 tools |
+| 6 | 수술도구 7개 | 🟡 Pick data done — 7 tools × 100 episodes on a fixed tray layout (`bigse0u1/xlerobot_scrub_7tool`); SmolVLA fine-tuning from `smolvla_base` on RunPod RTX 5090 in progress. Place (tray return) data also being recorded (`bigse0u1/xlerobot_scrub_7tool_place`, 567 episodes so far) |
 | 7 | 왼팔 4개 / 오른팔 3개 역할 분담 | ⬜ Not implemented (`active_arm`/`held_tool` state not yet tracked) |
 | 8 | Whisper 연결 | 🟡 Mic → canonical tool label → GUI task prompt is wired and triggers the full demo; no Tray Slot lookup or Command Parser state machine yet |
 | 9 | Fixed Tray Slot 연결 | ⬜ Not started |
@@ -366,8 +398,8 @@ Status against the STEP 1–20 development order in [`docs/research_plan.md`](do
 | 15 | Vision-Guided Handover | ⬜ Not started — current handoff replays a single pre-recorded fixed pose, not hand-position-driven |
 | 16 | Return Zone | ⬜ Not started |
 | 17 | Tool Retrieval | ⬜ Not started |
-| 18 | Tray Return | ⬜ Not started |
+| 18 | Tray Return | 🟡 Place demonstration data being recorded (separate Place recorder in the GUI); no policy trained yet |
 | 19 | Wrong-Slot Disturbance Experiment | ⬜ Not started |
 | 20 | End-to-End Evaluation | ⬜ Not started |
 
-**Takeaway**: the manipulation core (pick, grip-lock, rotate, scripted handoff, voice trigger, emergency stop) works end-to-end for a 2-tool case on a fixed layout. The next structural pieces — per-tool data scale-up (STEP 5–6), tray-slot state + handle classifier (STEP 9–11), and real hand detection to replace the scripted handoff pose (STEP 13–15) — are what's needed to match the paper's "Proposed" method (§31, Method C) instead of today's "SmolVLA-only on a fixed layout" approximation.
+**Takeaway**: the manipulation core (pick, grip-lock, rotate, scripted handoff, voice trigger, emergency stop) works end-to-end for a 2-tool case on a fixed layout, and the 7-tool Pick dataset (700 episodes) is complete with SmolVLA fine-tuning from `smolvla_base` underway. The next structural pieces — tray-slot state + handle classifier with tray scan and instruction remapping (STEP 9–11, the paper's Verify & Recover method), and real hand detection to replace the scripted handoff pose (STEP 13–15) — are what's needed to match the paper's "Proposed" method (§31, Method C) instead of today's "SmolVLA-only on a fixed layout" approximation.

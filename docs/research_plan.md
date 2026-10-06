@@ -421,9 +421,32 @@ ACT vs SmolVLA
 7개 → 총 560~700 episodes
 ```
 
+## 실제 수집 현황
+
+Pilot 단계(4개 도구)는 건너뛰고 바로 7개 도구 Main Dataset을 수집하였다.
+
+```text
+Pick:  7개 도구 × 100 episodes = 700 episodes (246,851 frames, 30 fps)
+       고정 tray 배치 (도구 위치 이동 없음)
+       Dataset: bigse0u1/xlerobot_scrub_7tool
+
+Place: 도구를 든 상태에서 원래 slot에 내려놓는 demonstration (Tray Return용)
+       Dataset: bigse0u1/xlerobot_scrub_7tool_place (수집 중)
+```
+
+Task instruction은 도구별로 하나의 문장으로 고정한다 (예: `"Pick up the grasper."`, Clipper는 `"Pick up the clippers."`). 추론 시 음성 명령으로 생성하는 instruction도 학습 문장과 정확히 일치해야 한다.
+
+## 학습 설정
+
+- SmolVLA는 사전학습된 `lerobot/smolvla_base`에서 fine-tuning한다. (2-tool pilot은 VLM 사전학습 가중치 없이 학습되어 language instruction을 거의 활용하지 못했다.)
+- Head / Left Wrist / Right Wrist 카메라를 smolvla_base의 `camera1 / camera2 / camera3` 입력으로 매핑한다.
+- Cloud GPU (RTX 5090 32GB), batch 64 × 30,000 steps (약 8 epoch).
+
 ---
 
 # 15. 데이터 Variation
+
+> 현재 Pick 데이터는 **고정 배치**로 수집하였으므로 아래의 위치/각도 variation은 적용하지 않았다. 고정 배치에서는 도구 이름과 slot이 1:1로 대응하며, 도구가 잘못 놓인 경우는 Tray Scan + Instruction Remapping(§12.1)으로 처리한다. 아래 variation은 향후 랜덤 배치로 확장할 때 적용한다.
 
 같은 위치에서 반복만 하지 않고 다음 variation을 포함한다.
 
@@ -681,6 +704,8 @@ Place
 ```
 
 가 가능하다.
+
+Place 동작은 Pick과 마찬가지로 imitation learning으로 학습한다. 도구를 든 Ready Pose에서 시작하여 원래 slot에 내려놓고 gripper를 여는 demonstration을 별도 데이터셋으로 수집한다 (`"Place the scissors back in the tray."`). 고정 배치이므로 instruction의 도구 이름이 곧 home slot을 의미한다.
 
 ---
 
