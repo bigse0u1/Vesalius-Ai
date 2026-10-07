@@ -16,7 +16,7 @@ This is the manipulation/teleop layer for the **Y-MAS 베살리우스 팀** lapa
 
 ## Features
 
-- Real-time bimanual teleoperation over ZMQ (leader arms on desktop → follower arms/wheels/head on Jetson)
+- Real-time bimanual teleoperation over ZMQ (leader arms on desktop → follower arms/wheels/head on Jetson); leader arms are optional and hot-pluggable
 - Head + dual wrist camera streaming
 - MPU6050 IMU with gyro-bias calibration and accumulated yaw angle (for precise 90° turns)
 - Live per-motor temperature readout (14 motors: both arms + head)
@@ -223,8 +223,17 @@ Fill in sidebar settings and click **연결**:
 | Jetson IP | (matches your Jetson's current IP) |
 | CMD 포트 | `5555` |
 | OBS 포트 | `5556` |
-| 왼쪽 리더암 | `/dev/ttyACM0` |
-| 오른쪽 리더암 | `/dev/ttyACM1` |
+| 왼쪽 리더암 | `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6081776-if00` |
+| 오른쪽 리더암 | `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6083489-if00` |
+
+**Leader arms are optional.** Connecting only needs the Jetson; the leader arms are attached by a background watcher that retries every 2 s:
+
+- Without leader arms, AI 모드, head (arrow keys) and wheels (i/j/k/l) all work; no arm keys are sent, so the follower arms simply hold their last pose.
+- Plug the leader arms in at any time and they connect automatically; unplug them and the GUI keeps running (arms hold), then reconnects when they're plugged back in. The status line under **연결** shows the current leader state.
+- Leader connection runs off the control loop, so a calibration prompt in the terminal (`Press ENTER to use provided calibration file…`) won't freeze head/wheel/AI commands.
+- Dataset recording skips frames that have no arm action (no leader and no AI), so a missing leader can't silently record all-zero arm actions.
+
+Use the `/dev/serial/by-id/...` paths rather than `/dev/ttyACM*`: ACM numbers are assigned in plug-in order, so after a replug the left leader could end up driving the right follower. Find your own IDs with `ls -l /dev/serial/by-id/`.
 
 ## Controls
 
