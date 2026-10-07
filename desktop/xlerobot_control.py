@@ -89,7 +89,6 @@ STATE_KEYS = [f"{k}.pos" for k in ARM_KEYS_L + ARM_KEYS_R] + ["head_motor_1.pos"
 ACTION_KEYS = [f"{k}.pos" for k in ARM_KEYS_L + ARM_KEYS_R] + [
     "head_motor_1.pos", "head_motor_2.pos", "x.vel", "y.vel", "theta.vel"
 ]
-ARM_ACTION_KEYS = [f"{k}.pos" for k in ARM_KEYS_L + ARM_KEYS_R]
 DATASET_FEATURES = {
     "observation.state": {"dtype": "float32", "shape": (len(STATE_KEYS),), "names": STATE_KEYS},
     "action": {"dtype": "float32", "shape": (len(ACTION_KEYS),), "names": ACTION_KEYS},
@@ -133,7 +132,6 @@ class Signals(QObject):
     status_changed = pyqtSignal(str)
     policy_loaded  = pyqtSignal(bool, str)
     voice_done     = pyqtSignal(bool, str, str)
-    leader_changed = pyqtSignal(bool, str)
 
 
 class ControlThread(threading.Thread):
@@ -193,46 +191,16 @@ class ControlThread(threading.Thread):
         action_vec = action_out.numpy()
         return {k: float(v) for k, v in zip(ACTION_KEYS, action_vec)}
 
-    LEADER_RETRY_S = 2.0
-
-    def _leader_watcher(self):
-        """리더암은 선택 사항: 없으면 2초마다 재시도, 꽂히면 자동 연결.
-
-        connect()는 캘리브레이션 확인용 input()에서 멈출 수 있으므로 제어 루프가 아닌
-        별도 스레드에서 실행한다 (제어 루프는 그동안 헤드/바퀴/AI 명령을 계속 전송).
-        """
-        ports = (self.cfg["left_port"], self.cfg["right_port"])
-        while self.running:
-            if self.teleop is None and all(os.path.exists(p) for p in ports):
-                leader = None
-                try:
-                    leader = BiSOLeader(BiSOLeaderConfig(
-                        id=self.cfg["teleop_id"],
-                        left_arm_config=SOLeaderTeleopConfig(port=ports[0]),
-                        right_arm_config=SOLeaderTeleopConfig(port=ports[1]),
-                    ))
-                    leader.connect()
-                    if not self.running:
-                        leader.disconnect()
-                        return
-                    self.teleop = leader
-                    self.signals.leader_changed.emit(True, "리더암 연결됨 ✓")
-                except Exception as e:
-                    try:
-                        if leader: leader.disconnect()
-                    except Exception: pass
-                    self.signals.leader_changed.emit(False, f"리더암 연결 실패 (재시도 중): {e}")
-            time.sleep(self.LEADER_RETRY_S)
-
-    def _drop_leader(self, reason):
-        leader, self.teleop = self.teleop, None
-        try:
-            if leader: leader.disconnect()
-        except Exception: pass
-        self.signals.leader_changed.emit(False, reason)
-
     def run(self):
         try:
+            leader_cfg = BiSOLeaderConfig(
+                id=self.cfg["teleop_id"],
+                left_arm_config=SOLeaderTeleopConfig(port=self.cfg["left_port"]),
+                right_arm_config=SOLeaderTeleopConfig(port=self.cfg["right_port"]),
+            )
+            self.teleop = BiSOLeader(leader_cfg)
+            self.teleop.connect()
+
             ctx = zmq.Context()
             self.cmd_sock = ctx.socket(zmq.PUSH)
             self.cmd_sock.setsockopt(zmq.CONFLATE, 1)
@@ -244,8 +212,6 @@ class ControlThread(threading.Thread):
 
             self.running = True
             self.signals.status_changed.emit("연결됨 ✓")
-            self.signals.leader_changed.emit(False, "리더암 없음 — 연결 대기 중 (AI 모드/헤드/바퀴는 사용 가능)")
-            threading.Thread(target=self._leader_watcher, daemon=True).start()
 
             while self.running:
                 try:
@@ -263,12 +229,8 @@ class ControlThread(threading.Thread):
                         if action is None:
                             time.sleep(1/60)
                             continue
-                    elif self.teleop is not None:
-                        try:
-                            action = self.teleop.get_action()
-                        except Exception as e:
-                            self._drop_leader(f"리더암 연결 끊김 — 다시 꽂으면 자동 연결: {e}")
-                            continue
+                    else:
+                        action = self.teleop.get_action()
                         # BiSOLeader returns "left_shoulder_pan.pos" etc; the dataset/policy
                         # convention (and the robot's own remap) expects "left_arm_shoulder_pan.pos"
                         action = {
@@ -277,9 +239,6 @@ class ControlThread(threading.Thread):
                             else k: v
                             for k, v in action.items()
                         }
-                    else:
-                        # 리더암 없음: 팔 키를 보내지 않으면 Jetson은 팔에 쓰지 않으므로 마지막 자세 유지
-                        action = {}
 
                     with self._lock:
                         action.update({
@@ -298,8 +257,7 @@ class ControlThread(threading.Thread):
 
     def stop(self):
         self.running = False
-        leader, self.teleop = self.teleop, None
-        for obj in [leader, self.cmd_sock, self.obs_sock]:
+        for obj in [self.teleop, self.cmd_sock, self.obs_sock]:
             try:
                 if obj: obj.disconnect() if hasattr(obj, 'disconnect') else obj.close()
             except: pass
@@ -613,7 +571,6 @@ class MainWindow(QMainWindow):
         self.signals.status_changed.connect(lambda m: self.statusBar().showMessage(m))
         self.signals.policy_loaded.connect(self._on_policy_loaded)
         self.signals.voice_done.connect(self._on_voice_done)
-        self.signals.leader_changed.connect(self._on_leader_changed)
         self.ctrl = None
         self.policy = None
         self.preprocessor = None
@@ -672,8 +629,8 @@ class MainWindow(QMainWindow):
         self.f_ip    = QLineEdit("192.168.0.34")
         self.f_cmd   = QLineEdit("5555")
         self.f_obs   = QLineEdit("5556")
-        self.f_lport = QLineEdit("/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6081776-if00")
-        self.f_rport = QLineEdit("/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6083489-if00")
+        self.f_lport = QLineEdit("/dev/ttyACM0")
+        self.f_rport = QLineEdit("/dev/ttyACM1")
         self.f_tid   = QLineEdit("xlerobot_leader")
         for lbl, w in [("Jetson IP",self.f_ip),("CMD 포트",self.f_cmd),
                         ("OBS 포트",self.f_obs),("왼쪽 리더암",self.f_lport),
@@ -683,10 +640,6 @@ class MainWindow(QMainWindow):
         self.btn.setStyleSheet("QPushButton{background:#238636;color:white;padding:8px;border-radius:4px;font-weight:bold;}QPushButton:hover{background:#2ea043;}")
         self.btn.clicked.connect(self._toggle)
         fl.addRow(self.btn)
-        self.l_leader = QLabel("리더암: -")
-        self.l_leader.setWordWrap(True)
-        self.l_leader.setStyleSheet("color:#8b949e;font-family:monospace;")
-        fl.addRow(self.l_leader)
         sl.addWidget(cg)
 
         # 조종 키
@@ -1179,10 +1132,6 @@ class MainWindow(QMainWindow):
             return None
         state = np.array([obs.get(k, 0.0) or 0.0 for k in STATE_KEYS], dtype=np.float32)
         action_src = self.ctrl.last_action if self.ctrl else {}
-        if not all(k in action_src for k in ARM_ACTION_KEYS):
-            # 리더암도 AI도 팔을 움직이지 않는 상태 — 팔 action이 0으로 기록되지 않도록 건너뜀
-            self.statusBar().showMessage("팔 action 없음 (리더암 미연결) — 이 프레임은 기록하지 않음")
-            return None
         action = np.array([action_src.get(k, 0.0) or 0.0 for k in ACTION_KEYS], dtype=np.float32)
         return {
             "observation.images.head": head_img,
@@ -1192,10 +1141,6 @@ class MainWindow(QMainWindow):
             "action": action,
             "task": task,
         }
-
-    def _on_leader_changed(self, ok, msg):
-        self.l_leader.setText(f"리더암: {msg}")
-        self.l_leader.setStyleSheet(f"color:{'#7ee787' if ok else '#d29922'};font-family:monospace;")
 
     def _toggle(self):
         if self.ctrl and self.ctrl.running:
