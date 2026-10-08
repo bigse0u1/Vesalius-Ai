@@ -13,10 +13,12 @@
 - 잘못된 도구 전달 최소화
 - 안정적인 grasp
 - 정확한 handover
-- 사용한 도구의 정확한 회수
+- 사용한 도구의 정확한 회수 (future work)
 - 높은 End-to-End Success Rate
 
 즉, 연구의 핵심은 **속도보다 정확성과 신뢰성**이다.
+
+> **범위 조정 (2026-10):** ICEIC 2027 마감 일정상 도구 회수 및 Tray 복귀(§25–§27, STEP 16–18)는 본 논문 범위에서 제외하고 **future work**로 둔다. 대신 음성 요청 → 도구 선택 → Verify & Recover → Pick → 90° 회전 → Handover까지의 정확도와 실험 완성도에 집중한다.
 
 ---
 
@@ -69,12 +71,10 @@ Hand Detection
 Vision-Guided Handover
         ↓
 Instrument Use
-        ↓
-Return Zone
-        ↓
-Retrieval
-        ↓
-Tray Return
+        ┆
+        ┆ (future work)
+        ┆
+Return Zone → Retrieval → Tray Return
 ```
 
 ---
@@ -431,7 +431,7 @@ Pick:  7개 도구 × 100 episodes = 700 episodes (246,851 frames, 30 fps)
        Dataset: bigse0u1/xlerobot_scrub_7tool
 
 Place: 도구를 든 상태에서 원래 slot에 내려놓는 demonstration (Tray Return용)
-       Dataset: bigse0u1/xlerobot_scrub_7tool_place (수집 중)
+       Dataset: bigse0u1/xlerobot_scrub_7tool_place (567 episodes에서 수집 중단 — future work)
 ```
 
 Task instruction은 도구별로 하나의 문장으로 고정한다 (예: `"Pick up the grasper."`, Clipper는 `"Pick up the clippers."`). 추론 시 음성 명령으로 생성하는 instruction도 학습 문장과 정확히 일치해야 한다.
@@ -660,6 +660,8 @@ Handover  → Hand Detection + Depth + Control
 
 # 25. 도구 회수
 
+> **future work** — 본 논문(ICEIC 2027) 범위에서 제외. §25–§27은 향후 확장을 위한 설계로 남겨둔다.
+
 초기에는 의사 손에서 직접 다시 받지 않고 Return Zone을 사용한다.
 
 ```text
@@ -767,17 +769,13 @@ VISION-GUIDED HANDOVER
 ↓
 RELEASE
 ↓
-WAIT FOR USE
-↓
-RETURN ZONE
-↓
-RETRIEVAL
-↓
-ROTATE -90°
-↓
-TRAY RETURN
-↓
 WAIT
+```
+
+향후 확장 (future work):
+
+```text
+RELEASE → WAIT FOR USE → RETURN ZONE → RETRIEVAL → ROTATE -90° → TRAY RETURN → WAIT
 ```
 
 ---
@@ -962,9 +960,8 @@ Handover
 - Handover Success Rate
 - Wrong Tool Handover Rate
 - Disturbance Recovery Rate (잘못 배치된 상황에서 올바른 도구를 전달한 비율)
-- Retrieval Success Rate
-- Correct Return Rate
 - End-to-End Success Rate
+- (future work) Retrieval Success Rate, Correct Return Rate
 
 Response Time은 보조 지표로 기록한다.
 
@@ -991,13 +988,12 @@ Response Time은 보조 지표로 기록한다.
 - 7 laparoscopic instruments
 - Surgeon
 - Handover Area
-- Return Zone
 
 ## Figure 2 — Overall System Pipeline
 
 ```text
 Voice → Whisper → Requested Tool → Tray Prior → Visual Verification
-→ ACT / SmolVLA → Pick → 90° Rotation → Hand Detection → Handover → Return
+→ ACT / SmolVLA → Pick → 90° Rotation → Hand Detection → Handover
 ```
 
 ## Figure 3 — Handle-Based Verification
@@ -1064,9 +1060,9 @@ STEP 12 Pick → 90° Rotation
 STEP 13 D415 Hand Detection
 STEP 14 Depth → 3D Hand Position
 STEP 15 Vision-Guided Handover
-STEP 16 Return Zone
-STEP 17 Tool Retrieval
-STEP 18 Tray Return
+STEP 16 Return Zone        (future work)
+STEP 17 Tool Retrieval     (future work)
+STEP 18 Tray Return        (future work)
 STEP 19 Wrong-Slot Disturbance Experiment
 STEP 20 End-to-End Evaluation
 ```

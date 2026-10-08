@@ -21,7 +21,8 @@ This is the manipulation/teleop layer for the **Y-MAS 베살리우스 팀** lapa
 - MPU6050 IMU with gyro-bias calibration and accumulated yaw angle (for precise 90° turns)
 - Live per-motor temperature readout (14 motors: both arms + head)
 - Embedded 3D robot pose visualization (matplotlib, simplified forward kinematics)
-- Tabbed control GUI (조종 / AI 모드 on the left, 데이터 / 상태 on the right) instead of one long scrolling sidebar
+- Tabbed control GUI (조종 / AI 모드 on the left, 데이터 / 분류기 / 상태 on the right) instead of one long scrolling sidebar
+- Handle-classifier data capture: fixed scan head pose + per-slot ROI crops with arrangement labels
 - One-click dataset recording (LeRobotDataset) for imitation learning — separate Pick and Place (tray return) datasets, episode start/save/discard, resumable across sessions, background upload to Hugging Face
 - Ready for **ACT** / **SmolVLA** training via `lerobot-train`
 - Experimental **AI 모드**: run a trained checkpoint directly on the robot from the control GUI (no separate eval script needed)
@@ -346,6 +347,33 @@ Before using the full sequence, record a handoff pose once: teleop the arm to a 
 
 > ⚠️ `observation.*.gripper.pos` is a raw motor reading, but `xlerobot.py`'s `send_action()` inverts gripper *actions* (`100 - value`) before writing to the motor. Any code that reads a gripper position from an observation and replays it as an action (grip-lock, saved handoff pose) must re-invert it (`100 - value`) first, or the gripper does the opposite of what was intended — see `_obs_to_locked_action()` in `xlerobot_control.py`. If you ever see the gripper open right when it should be holding the tool, this is the first thing to check.
 
+## Classifier Data Capture (handle classifier)
+
+The **분류기** tab (right side) collects training images for the handle classifier used by the Verify & Recover method (`docs/research_plan.md` §6–§8). It takes one head-camera image at a fixed scan pose and crops one region per tray slot.
+
+One-time setup:
+
+1. Turn the head (arrow keys) so all 7 slot handles are clearly visible, then **현재 자세 저장** to store it as the scan pose (default: pan −4, tilt 70 — the head pose used for Pick recording).
+2. Check **영역 편집** and drag a box over each slot's handle on the head-camera view; it advances to the next slot after each drag. Uncheck when done. Slot boxes are drawn only while the 분류기 tab is open.
+
+Per arrangement (~30 s):
+
+1. **무작위 섞기** suggests a new slot order — place the tools that way (or set the dropdowns to match what you placed). Set a slot to **EMPTY** to collect "no tool" samples.
+2. Optionally note lighting / tool-angle changes in **메모**.
+3. Press **📷 촬영** 2–3 times, nudging the tools slightly between shots.
+
+Capture is refused if the head isn't at the scan pose (**스캔 자세로 이동** fixes that) or if the same tool is assigned to two slots. Aim for ~40–50 arrangements (~120–150 images).
+
+Output (`~/xlerobot_classifier_data` by default):
+
+```
+raw/<time>.jpg                 full head image (viewer-correct colors)
+crops/<CLASS>/<time>_s<N>.png  one crop per slot, ImageFolder layout (7 tools + EMPTY)
+labels.jsonl                   per image: arrangement, arrangement_id, ROIs, head pose, note
+```
+
+Split train/test **by `arrangement_id`**, not by image — shots of the same arrangement in both splits inflate accuracy. Scan pose and ROIs live in `desktop/classifier_config.json` (git-ignored, setup-specific like `handoff_pose.json`).
+
 ## Voice Command Testing (Whisper)
 
 `desktop/whisper_test.py` is a standalone mic → [faster-whisper](https://github.com/SYSTRAN/faster-whisper) → canonical-tool-name script, useful for prototyping the "의사 음성 요청 → 도구 선택" pipeline before wiring it into the robot.
@@ -390,15 +418,15 @@ Status against the STEP 1–20 development order in [`docs/research_plan.md`](do
 | 7 | 왼팔 4개 / 오른팔 3개 역할 분담 | ⬜ Not implemented (`active_arm`/`held_tool` state not yet tracked) |
 | 8 | Whisper 연결 | 🟡 Mic → canonical tool label → GUI task prompt is wired and triggers the full demo; no Tray Slot lookup or Command Parser state machine yet |
 | 9 | Fixed Tray Slot 연결 | ⬜ Not started |
-| 10 | Handle Classifier 학습 | ⬜ Not started |
+| 10 | Handle Classifier 학습 | 🟡 Data capture tool ready (분류기 tab: scan pose, per-slot ROIs, shuffled arrangements → labeled crops); data collection and training not started |
 | 11 | Visual Verification 연결 | ⬜ Not started |
 | 12 | Pick → 90° Rotation | ✅ Done — settle-detection + grip-lock + IMU-feedback rotation |
 | 13 | D415 Hand Detection | ⬜ Not started |
 | 14 | Depth → 3D Hand Position | ⬜ Not started |
 | 15 | Vision-Guided Handover | ⬜ Not started — current handoff replays a single pre-recorded fixed pose, not hand-position-driven |
-| 16 | Return Zone | ⬜ Not started |
-| 17 | Tool Retrieval | ⬜ Not started |
-| 18 | Tray Return | 🟡 Place demonstration data being recorded (separate Place recorder in the GUI); no policy trained yet |
+| 16 | Return Zone | ⏭️ Future work — out of scope for ICEIC 2027 |
+| 17 | Tool Retrieval | ⏭️ Future work — out of scope for ICEIC 2027 |
+| 18 | Tray Return | ⏭️ Future work — Place data recording stopped at 567 episodes (`bigse0u1/xlerobot_scrub_7tool_place`) |
 | 19 | Wrong-Slot Disturbance Experiment | ⬜ Not started |
 | 20 | End-to-End Evaluation | ⬜ Not started |
 

@@ -6,7 +6,7 @@ import zmq
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QGroupBox, QPushButton, QLineEdit, QFormLayout, QScrollArea,
-    QProgressBar, QTabWidget
+    QProgressBar, QTabWidget, QComboBox, QSpinBox, QCheckBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QPalette, QColor
@@ -61,6 +61,10 @@ TOOL_TASK_NAMES = {
     "IRRIGATOR": "irrigator",
     "SPECIMEN_BAG": "specimen bag",
 }
+
+# Standard tray layout, slot 1 → 7 (left → right), as used for the fixed-layout Pick dataset
+TRAY_LAYOUT = ["GRASPER", "BIPOLAR", "SCISSORS", "CLIPPER", "HOOK", "IRRIGATOR", "SPECIMEN_BAG"]
+EMPTY_SLOT = "EMPTY"
 
 
 def _to_canonical_tool(text):
@@ -374,6 +378,38 @@ class CamLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background:#0d1117; color:#58a6ff; border:1px solid #30363d; font-size:13px;")
         self.setMinimumSize(200, 150)
+        self._img_size = None      # (w, h) of the last frame, for widget→image coordinate mapping
+        self.on_roi_drawn = None   # callback(x1, y1, x2, y2) in image pixels; drag is enabled while set
+        self._drag_start = None
+        self._drag_rect = None
+
+    def _to_image_xy(self, pos):
+        pm = self.pixmap()
+        if pm is None or pm.isNull() or self._img_size is None:
+            return None
+        iw, ih = self._img_size
+        ox = (self.width() - pm.width()) / 2
+        oy = (self.height() - pm.height()) / 2
+        x = (pos.x() - ox) * iw / pm.width()
+        y = (pos.y() - oy) * ih / pm.height()
+        return int(min(max(x, 0), iw - 1)), int(min(max(y, 0), ih - 1))
+
+    def mousePressEvent(self, e):
+        if self.on_roi_drawn is None: return super().mousePressEvent(e)
+        self._drag_start = self._to_image_xy(e.pos())
+
+    def mouseMoveEvent(self, e):
+        if self.on_roi_drawn is None or self._drag_start is None: return super().mouseMoveEvent(e)
+        p = self._to_image_xy(e.pos())
+        if p: self._drag_rect = (*self._drag_start, *p)
+
+    def mouseReleaseEvent(self, e):
+        if self.on_roi_drawn is None or self._drag_start is None: return super().mouseReleaseEvent(e)
+        p = self._to_image_xy(e.pos())
+        x0, y0 = self._drag_start
+        self._drag_start = self._drag_rect = None
+        if p and abs(p[0] - x0) > 5 and abs(p[1] - y0) > 5:
+            self.on_roi_drawn(min(x0, p[0]), min(y0, p[1]), max(x0, p[0]), max(y0, p[1]))
 
     def show_frame(self, b64, boxes=None):
         if not b64: return
@@ -381,13 +417,19 @@ class CamLabel(QLabel):
             arr = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
             f = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if f is None: return
+            if self._drag_rect:
+                boxes = list(boxes or []) + [{"x1": self._drag_rect[0], "y1": self._drag_rect[1],
+                                              "x2": self._drag_rect[2], "y2": self._drag_rect[3],
+                                              "label": "", "color": (255, 255, 255)}]
             if boxes:
                 for b in boxes:
-                    cv2.rectangle(f, (b["x1"], b["y1"]), (b["x2"], b["y2"]), (0, 255, 0), 2)
-                    cv2.putText(f, f"{b['label']} {b['conf']:.2f}",
-                                (b["x1"], max(b["y1"]-6, 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    color = b.get("color", (0, 255, 0))
+                    cv2.rectangle(f, (b["x1"], b["y1"]), (b["x2"], b["y2"]), color, 2)
+                    text = f"{b['label']} {b['conf']:.2f}" if "conf" in b else b["label"]
+                    cv2.putText(f, text, (b["x1"], max(b["y1"]-6, 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             h, w, c = f.shape
+            self._img_size = (w, h)
             qi = QImage(f.data, w, h, w*c, QImage.Format_RGB888)
             self.setPixmap(QPixmap.fromImage(qi).scaled(
                 self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -561,6 +603,198 @@ class DatasetRecorder(QGroupBox):
         self.btn_upload.setEnabled(not ok)
 
 
+class ClassifierCapture(QGroupBox):
+    """손잡이 분류기 학습 데이터 수집 패널.
+
+    고정된 스캔 헤드 자세에서 head camera 한 장을 찍고, 슬롯별 ROI로 잘라
+    crops/<CLASS>/ 에 저장 (ImageFolder 구조). 원본과 배치 라벨은 raw/, labels.jsonl 에 기록.
+    배치(arrangement)는 train/test 분할 시 그룹 단위로 쓰도록 arrangement_id로 남긴다.
+    """
+    N_SLOTS = 7
+
+    def __init__(self, config_path, cam, get_head_b64, get_head, set_head, status):
+        super().__init__("분류기 데이터 수집")
+        self.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
+        self._config_path = config_path
+        self._cam = cam
+        self._get_head_b64 = get_head_b64
+        self._get_head = get_head
+        self._set_head = set_head
+        self._status = status
+        self._load_config()
+
+        fl = QFormLayout(self); fl.setSpacing(4)
+        self.f_dir = QLineEdit(os.path.expanduser("~/xlerobot_classifier_data"))
+        fl.addRow("저장 폴더:", self.f_dir)
+
+        # 스캔 헤드 자세
+        self.l_scan = QLabel(); self.l_scan.setStyleSheet("color:#f0883e;font-family:monospace;")
+        fl.addRow("스캔 자세:", self.l_scan)
+        hb = QHBoxLayout()
+        b_save_pose = QPushButton("현재 자세 저장"); b_save_pose.clicked.connect(self._save_scan_pose)
+        b_goto_pose = QPushButton("스캔 자세로 이동"); b_goto_pose.clicked.connect(self._goto_scan_pose)
+        hb.addWidget(b_save_pose); hb.addWidget(b_goto_pose)
+        fl.addRow(hb)
+
+        # 슬롯 영역 (ROI)
+        self.cb_show = QCheckBox("헤드 화면에 슬롯 영역 표시"); self.cb_show.setChecked(True)
+        fl.addRow(self.cb_show)
+        self.cb_edit = QCheckBox("영역 편집 (헤드 화면에서 드래그)")
+        self.cb_edit.toggled.connect(self._toggle_edit)
+        self.sp_slot = QSpinBox(); self.sp_slot.setRange(1, self.N_SLOTS)
+        eh = QHBoxLayout(); eh.addWidget(self.cb_edit); eh.addWidget(QLabel("슬롯")); eh.addWidget(self.sp_slot)
+        fl.addRow(eh)
+
+        # 배치 입력
+        self.combos = []
+        options = TRAY_LAYOUT + [EMPTY_SLOT]
+        for i in range(self.N_SLOTS):
+            c = QComboBox(); c.addItems(options); c.setCurrentText(TRAY_LAYOUT[i])
+            self.combos.append(c)
+            fl.addRow(f"Slot {i+1}:", c)
+        bb = QHBoxLayout()
+        b_default = QPushButton("기본 배치"); b_default.clicked.connect(self._set_default)
+        b_shuffle = QPushButton("무작위 섞기"); b_shuffle.clicked.connect(self._shuffle)
+        bb.addWidget(b_default); bb.addWidget(b_shuffle)
+        fl.addRow(bb)
+        self.f_note = QLineEdit(); self.f_note.setPlaceholderText("예: 조명 어둡게, 도구 비틀림")
+        fl.addRow("메모:", self.f_note)
+
+        self.btn_capture = QPushButton("📷 촬영")
+        self.btn_capture.setStyleSheet("QPushButton{background:#238636;color:white;padding:8px;border-radius:4px;font-weight:bold;}")
+        self.btn_capture.clicked.connect(self._capture)
+        fl.addRow(self.btn_capture)
+        self.l_count = QLabel(); self.l_count.setWordWrap(True)
+        self.l_count.setStyleSheet("color:#7ee787;font-family:monospace;")
+        fl.addRow(self.l_count)
+        self.f_dir.editingFinished.connect(self._refresh_counts)
+        self._update_scan_label()
+        self._refresh_counts()
+
+    # ── config (scan pose + ROIs) ──
+    def _load_config(self):
+        self.scan_pan, self.scan_tilt = -4.0, 70.0
+        w = 80  # default: 7 boxes spread across the 640×480 head image
+        self.rois = [[20 + i * 88, 280, 20 + i * 88 + w, 420] for i in range(self.N_SLOTS)]
+        try:
+            with open(self._config_path) as f:
+                cfg = json.load(f)
+            self.scan_pan, self.scan_tilt = cfg["scan_pan"], cfg["scan_tilt"]
+            if len(cfg["rois"]) == self.N_SLOTS:
+                self.rois = cfg["rois"]
+        except (OSError, ValueError, KeyError):
+            pass
+
+    def _save_config(self):
+        with open(self._config_path, "w") as f:
+            json.dump({"scan_pan": self.scan_pan, "scan_tilt": self.scan_tilt, "rois": self.rois}, f, indent=2)
+
+    def _update_scan_label(self):
+        self.l_scan.setText(f"pan={self.scan_pan:.1f}, tilt={self.scan_tilt:.1f}")
+
+    def _save_scan_pose(self):
+        self.scan_pan, self.scan_tilt = self._get_head()
+        self._save_config(); self._update_scan_label()
+        self._status(f"스캔 자세 저장: pan={self.scan_pan:.1f}, tilt={self.scan_tilt:.1f}")
+
+    def _goto_scan_pose(self):
+        self._set_head(self.scan_pan, self.scan_tilt)
+        self._status("스캔 자세로 이동")
+
+    def _at_scan_pose(self):
+        pan, tilt = self._get_head()
+        return abs(pan - self.scan_pan) < 0.5 and abs(tilt - self.scan_tilt) < 0.5
+
+    # ── ROI editing / overlay ──
+    def _toggle_edit(self, on):
+        self._cam.on_roi_drawn = self._on_roi_drawn if on else None
+
+    def _on_roi_drawn(self, x1, y1, x2, y2):
+        i = self.sp_slot.value() - 1
+        self.rois[i] = [x1, y1, x2, y2]
+        self._save_config()
+        self._status(f"Slot {i+1} 영역 저장: ({x1},{y1})–({x2},{y2})")
+        if i + 1 < self.N_SLOTS:
+            self.sp_slot.setValue(i + 2)  # 다음 슬롯으로 자동 이동
+
+    def overlay_boxes(self):
+        if not self.cb_show.isChecked():
+            return None
+        sel = self.sp_slot.value() - 1 if self.cb_edit.isChecked() else -1
+        return [{"x1": r[0], "y1": r[1], "x2": r[2], "y2": r[3],
+                 "label": f"{i+1}:{self.combos[i].currentText()[:4]}",
+                 "color": (255, 200, 0) if i == sel else (0, 255, 0)}
+                for i, r in enumerate(self.rois)]
+
+    # ── arrangement ──
+    def _set_default(self):
+        for c, t in zip(self.combos, TRAY_LAYOUT):
+            c.setCurrentText(t)
+
+    def _shuffle(self):
+        import random
+        order = TRAY_LAYOUT[:]
+        while order == TRAY_LAYOUT:
+            random.shuffle(order)
+        for c, t in zip(self.combos, order):
+            c.setCurrentText(t)
+        self._status("무작위 배치 제안 — 트레이를 이 순서대로 놓고 촬영하세요")
+
+    def arrangement(self):
+        return [c.currentText() for c in self.combos]
+
+    # ── capture ──
+    def _capture(self):
+        arr = self.arrangement()
+        tools = [t for t in arr if t != EMPTY_SLOT]
+        if len(tools) != len(set(tools)):
+            self._status("같은 도구가 두 슬롯에 지정됨 — 배치를 확인하세요"); return
+        if not self._at_scan_pose():
+            self._status("헤드가 스캔 자세가 아님 — '스캔 자세로 이동' 후 촬영하세요"); return
+        img = _decode_b64_image(self._get_head_b64())  # RGB, same as dataset/inference pipeline
+        if img is None:
+            self._status("헤드 카메라 이미지 없음 — 로봇 연결을 확인하세요"); return
+        root = self.f_dir.text()
+        ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # cv2.imwrite expects BGR → files look right in viewers
+        try:
+            os.makedirs(os.path.join(root, "raw"), exist_ok=True)
+            raw_rel = f"raw/{ts}.jpg"
+            cv2.imwrite(os.path.join(root, raw_rel), bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            h, w = bgr.shape[:2]
+            crops = []
+            for i, (label, (x1, y1, x2, y2)) in enumerate(zip(arr, self.rois)):
+                x1, x2 = max(0, x1), min(w, x2); y1, y2 = max(0, y1), min(h, y2)
+                d = os.path.join(root, "crops", label); os.makedirs(d, exist_ok=True)
+                rel = f"crops/{label}/{ts}_s{i+1}.png"
+                cv2.imwrite(os.path.join(root, rel), bgr[y1:y2, x1:x2])
+                crops.append(rel)
+            pan, tilt = self._get_head()
+            rec = {"time": ts, "image": raw_rel, "crops": crops, "arrangement": arr,
+                   "arrangement_id": ",".join(arr), "rois": self.rois,
+                   "head_pan": pan, "head_tilt": tilt, "note": self.f_note.text()}
+            with open(os.path.join(root, "labels.jsonl"), "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as e:
+            self._status(f"저장 실패: {e}"); return
+        self._refresh_counts()
+        self._status(f"촬영 저장: {raw_rel} (crop {len(crops)}장)")
+
+    def _refresh_counts(self):
+        path = os.path.join(self.f_dir.text(), "labels.jsonl")
+        n_img, arrs, per = 0, set(), {}
+        try:
+            with open(path) as f:
+                for line in f:
+                    r = json.loads(line); n_img += 1; arrs.add(r["arrangement_id"])
+                    for t in r["arrangement"]:
+                        per[t] = per.get(t, 0) + 1
+        except (OSError, ValueError):
+            pass
+        cls = "  ".join(f"{t[:4]}:{per.get(t, 0)}" for t in TRAY_LAYOUT + [EMPTY_SLOT])
+        self.l_count.setText(f"사진 {n_img}장 / 배치 {len(arrs)}종\n{cls}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -596,6 +830,7 @@ class MainWindow(QMainWindow):
         self.auto_rotate_target = 0.0
         self._demo_token = 0
         self._handoff_pose_path = os.path.expanduser("~/xlerobot-teleop/desktop/handoff_pose.json")
+        self._latest_head_b64 = ""
         self._build_ui()
         t = QTimer(self); t.timeout.connect(self._tick); t.start(50)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -777,6 +1012,25 @@ class MainWindow(QMainWindow):
         rl2.addWidget(self.rec_place)
         rl2.addStretch()
         tabs_r.addTab(data_scroll, "데이터")
+
+        cls_scroll, rl2 = self._tab_page()
+
+        # 분류기 데이터 수집 (손잡이 ROI crop)
+        self.cls_capture = ClassifierCapture(
+            os.path.expanduser("~/xlerobot-teleop/desktop/classifier_config.json"),
+            self.cam_head,
+            lambda: self._latest_head_b64,
+            lambda: (self.head_pan, self.head_tilt),
+            self._set_head_pose,
+            status)
+        rl2.addWidget(self.cls_capture)
+        rl2.addStretch()
+        tabs_r.addTab(cls_scroll, "분류기")
+        self._cls_tab = cls_scroll
+        self._tabs_r = tabs_r
+        # 탭을 벗어나면 영역 편집(드래그)도 끔 — 다른 작업 중 헤드 화면 클릭으로 영역이 바뀌지 않도록
+        tabs_r.currentChanged.connect(
+            lambda _: tabs_r.currentWidget() is not cls_scroll and self.cls_capture.cb_edit.setChecked(False))
 
         status_scroll, rl2 = self._tab_page()
 
@@ -1100,6 +1354,11 @@ class MainWindow(QMainWindow):
         self.btn_load_policy.setEnabled(True)
         self.btn_ai_mode.setEnabled(ok)
 
+    def _set_head_pose(self, pan, tilt):
+        # _tick이 다음 주기에 이 값을 ControlThread로 전송
+        self.head_pan = max(-100, min(100, pan))
+        self.head_tilt = max(-100, min(100, tilt))
+
     def _toggle_ai_mode(self):
         if not self.ctrl or not self.ctrl.running:
             self.statusBar().showMessage("먼저 로봇에 연결하세요")
@@ -1164,7 +1423,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("연결 중...")
 
     def _on_obs(self, obs):
-        self.cam_head.show_frame(obs.get("head", ""))
+        self._latest_head_b64 = obs.get("head", "")
+        cls_tab_open = self._tabs_r.currentWidget() is self._cls_tab
+        self.cam_head.show_frame(self._latest_head_b64, self.cls_capture.overlay_boxes() if cls_tab_open else None)
         self.cam_left.show_frame(obs.get("left_wrist", ""))
         self.cam_right.show_frame(obs.get("right_wrist", ""))
 
