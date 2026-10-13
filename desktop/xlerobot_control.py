@@ -6,7 +6,7 @@ import zmq
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QGroupBox, QPushButton, QLineEdit, QFormLayout, QScrollArea,
-    QProgressBar, QTabWidget, QComboBox, QSpinBox, QCheckBox
+    QProgressBar, QTabWidget, QComboBox, QSpinBox, QCheckBox, QSlider
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QImage, QPixmap, QPalette, QColor
@@ -65,6 +65,44 @@ TOOL_TASK_NAMES = {
 # Standard tray layout, slot 1 → 7 (left → right), as used for the fixed-layout Pick dataset
 TRAY_LAYOUT = ["GRASPER", "BIPOLAR", "SCISSORS", "CLIPPER", "HOOK", "IRRIGATOR", "SPECIMEN_BAG"]
 EMPTY_SLOT = "EMPTY"
+
+
+def verify_and_recover(requested, preds, method="proposed", conf_thr=0.8):
+    """Decide which slot to pick and which instruction to give the (fixed-layout) policy.
+
+    requested: canonical tool name, e.g. "SCISSORS"
+    preds:     [(label, confidence)] for slot 1..7 from the handle classifier (ignored for baseline)
+    The policy learned "Pick up the <tool>" as "go to that tool's home slot", so the instruction
+    names the *original owner* of the slot where the requested tool actually is.
+    Returns dict(status, slot, instruction, arm, reason). status ∈
+      baseline  — no verification, requested name as instruction
+      verified  — requested tool found in its home slot
+      recovered — found in another slot → instruction remapped to that slot
+      low_conf  — requested tool only seen below conf_thr → stop
+      not_found — requested tool not on the tray → stop
+    """
+    home = TRAY_LAYOUT.index(requested) + 1
+    def result(status, slot, reason):
+        if slot is None:
+            return {"status": status, "slot": None, "instruction": None, "arm": None, "reason": reason}
+        return {"status": status, "slot": slot,
+                "instruction": f"Pick up the {TOOL_TASK_NAMES[TRAY_LAYOUT[slot - 1]]}",
+                "arm": "left" if slot <= 4 else "right", "reason": reason}
+    if method == "baseline":
+        return result("baseline", home, "요청 도구 이름 그대로 (검증 없음)")
+    label, conf = preds[home - 1]
+    if label == requested and conf >= conf_thr:
+        return result("verified", home, f"Slot {home}에 {requested} 확인 ({conf:.2f})")
+    hits = [(c, i + 1) for i, (l, c) in enumerate(preds) if l == requested]
+    sure = [h for h in hits if h[0] >= conf_thr]
+    if sure:
+        c, slot = max(sure)
+        return result("recovered", slot,
+                      f"Slot {home}에는 {label} ({conf:.2f}) → {requested}는 Slot {slot} ({c:.2f})")
+    if hits:
+        c, slot = max(hits)
+        return result("low_conf", None, f"{requested} 후보 Slot {slot} 신뢰도 {c:.2f} < {conf_thr}")
+    return result("not_found", None, f"트레이에서 {requested}를 찾지 못함")
 
 
 def _to_canonical_tool(text):
@@ -136,6 +174,7 @@ class Signals(QObject):
     status_changed = pyqtSignal(str)
     policy_loaded  = pyqtSignal(bool, str)
     voice_done     = pyqtSignal(bool, str, str)
+    cls_loaded     = pyqtSignal(bool, str)
 
 
 class ControlThread(threading.Thread):
@@ -380,6 +419,9 @@ class CamLabel(QLabel):
         self.setMinimumSize(200, 150)
         self._img_size = None      # (w, h) of the last frame, for widget→image coordinate mapping
         self.on_roi_drawn = None   # callback(x1, y1, x2, y2) in image pixels; drag is enabled while set
+        self.ref_overlay = None    # RGB reference image blended over the frame (alignment guide)
+        self.ref_alpha = 0.5
+        self.ref_diff = False      # True: show |frame - reference| instead of a blend
         self._drag_start = None
         self._drag_rect = None
 
@@ -417,6 +459,9 @@ class CamLabel(QLabel):
             arr = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
             f = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if f is None: return
+            ref = self.ref_overlay
+            if ref is not None and ref.shape == f.shape:
+                f = cv2.absdiff(f, ref) if self.ref_diff else cv2.addWeighted(f, 1 - self.ref_alpha, ref, self.ref_alpha, 0)
             if self._drag_rect:
                 boxes = list(boxes or []) + [{"x1": self._drag_rect[0], "y1": self._drag_rect[1],
                                               "x2": self._drag_rect[2], "y2": self._drag_rect[3],
@@ -531,6 +576,10 @@ class DatasetRecorder(QGroupBox):
         else:
             if self.recording:
                 self._toggle_episode()
+            try:
+                self.dataset.finalize()  # parquet footer 기록 — 안 하면 파일이 열리지 않음
+            except Exception as e:
+                self._status(f"데이터셋 마무리 실패: {e}")
             self.dataset = None
             self.btn_dataset.setText("데이터셋 생성")
             self.btn_episode.setEnabled(False)
@@ -578,6 +627,9 @@ class DatasetRecorder(QGroupBox):
         if self.dataset is not None and self.recording:
             try: self.dataset.clear_episode_buffer()
             except Exception: pass
+        if self.dataset is not None:
+            try: self.dataset.finalize()
+            except Exception: pass
 
     def _upload_dataset(self):
         if self.dataset is None or self.recording:
@@ -603,6 +655,372 @@ class DatasetRecorder(QGroupBox):
         self.btn_upload.setEnabled(not ok)
 
 
+class HandleClassifier:
+    """ResNet18 손잡이 분류기 (classifier/train_classifier.py로 학습). 백그라운드에서 로드."""
+
+    def __init__(self, model_path):
+        self.model_path = model_path
+        self.model = self.tc = self.device = None
+        self.error = None
+        self.loading = False
+
+    def load_async(self, on_done):
+        if self.loading or self.model is not None:
+            return
+        self.loading = True
+
+        def _work():
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "classifier"))
+                import train_classifier as tc  # same preprocess() as training
+                import torch
+                ckpt = torch.load(self.model_path, map_location="cpu")
+                model = tc.make_model()
+                model.load_state_dict(ckpt["state_dict"])
+                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                self.model, self.tc = model.to(self.device).eval(), tc
+                on_done(True, f"분류기 로드 완료 ({self.device})")
+            except Exception as e:
+                self.error = str(e)
+                on_done(False, f"분류기 로드 실패: {e}")
+            finally:
+                self.loading = False
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def classify(self, img_rgb, rois):
+        """→ [(label, confidence)] per ROI"""
+        import torch
+        bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)  # preprocess() expects BGR like cv2.imread
+        h, w = bgr.shape[:2]
+        xs = []
+        for x1, y1, x2, y2 in rois:
+            crop = bgr[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            xs.append(self.tc.preprocess(crop, gray=False, train=False))
+        with torch.no_grad():
+            p = torch.softmax(self.model(torch.stack(xs).to(self.device)), 1).cpu()
+        conf, idx = p.max(1)
+        return [(self.tc.CLASSES[i], float(c)) for i, c in zip(idx.tolist(), conf.tolist())]
+
+
+class HandDetector:
+    """MediaPipe HandLandmarker (CPU, ~20 ms/frame). 손이 여럿이면 화면에서 가장 큰 손을 사용."""
+
+    def __init__(self, model_path):
+        self.model_path = model_path
+        self._det = None
+        self.error = None
+
+    def _ensure(self):
+        if self._det is None and self.error is None:
+            try:
+                import mediapipe as mp
+                from mediapipe.tasks import python as mpt
+                from mediapipe.tasks.python import vision
+                opt = vision.HandLandmarkerOptions(
+                    base_options=mpt.BaseOptions(model_asset_path=self.model_path),
+                    running_mode=vision.RunningMode.IMAGE, num_hands=2, min_hand_detection_confidence=0.5)
+                self._mp, self._det = mp, vision.HandLandmarker.create_from_options(opt)
+            except Exception as e:
+                self.error = str(e)
+        return self._det is not None
+
+    def detect(self, img_rgb):
+        """→ dict(cx, cy, box=(x1,y1,x2,y2), pts=[(x,y)...]) in pixels, or None"""
+        if not self._ensure():
+            return None
+        h, w = img_rgb.shape[:2]
+        r = self._det.detect(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(img_rgb)))
+        best = None
+        for lms in r.hand_landmarks:
+            pts = [(int(p.x * w), int(p.y * h)) for p in lms]
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+            palm = [pts[i] for i in (0, 5, 9, 13, 17)]  # 손목 + 손가락 뿌리 = 손바닥 중심
+            cand = {"cx": int(np.mean([p[0] for p in palm])), "cy": int(np.mean([p[1] for p in palm])),
+                    "box": (min(xs), min(ys), max(xs), max(ys)), "pts": pts, "area": area}
+            if best is None or area > best["area"]:
+                best = cand
+        return best
+
+
+def grid_cell(x, y, w, h, n=3):
+    """픽셀 좌표 → (row, col), 0..n-1 (row: 위→아래, col: 왼쪽→오른쪽)"""
+    return min(n - 1, int(y * n / h)), min(n - 1, int(x * n / w))
+
+
+def nearest_saved_cell(saved, cell):
+    """saved: {"r,c": pose}. 같은 칸이 없으면 가장 가까운 저장 칸 (맨해튼 거리)."""
+    if not saved:
+        return None
+    key = f"{cell[0]},{cell[1]}"
+    if key in saved:
+        return key
+    def dist(k):
+        r, c = map(int, k.split(","))
+        return abs(r - cell[0]) + abs(c - cell[1]), k
+    return min(saved, key=dist)
+
+
+def arm_from_instruction(text):
+    """'Pick up the <tool>' → 그 도구의 home slot 기준 팔 ('left'/'right'), 모르면 None.
+    고정 배치 정책은 도구 이름을 slot으로 해석하므로, remap된 instruction에도 그대로 맞다."""
+    t = text.strip().lower().rstrip(".")
+    for canon, name in TOOL_TASK_NAMES.items():
+        if t == f"pick up the {name}":
+            return "left" if TRAY_LAYOUT.index(canon) < 4 else "right"
+    return None
+
+
+class HandoverPanel(QGroupBox):
+    """손 위치 기반 핸드오버 설정: 시선(헤드) 자세 + 팔별 3×3 칸 자세 저장/테스트, 손 검출 미리보기."""
+
+    def __init__(self, config_path, get_obs, get_head, set_head, move_to, status):
+        super().__init__("손 위치 기반 핸드오버 (3×3)")
+        self.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
+        self._path, self._get_obs, self._get_head = config_path, get_obs, get_head
+        self._set_head, self._move_to, self._status = set_head, move_to, status
+        self.cfg = {"head": [-4.0, 40.0], "left": {}, "right": {}}
+        try:
+            with open(config_path) as f:
+                self.cfg.update(json.load(f))
+        except (OSError, ValueError):
+            pass
+        self.cell = (0, 1)
+        self.last_hand = None      # 미리보기/진행 중 마지막 검출 결과
+        self.last_hand_t = 0.0
+
+        fl = QFormLayout(self); fl.setSpacing(4); fl.setRowWrapPolicy(QFormLayout.WrapAllRows)
+        self.cb_preview = QCheckBox("손 검출 미리보기")
+        self.cb_preview.setToolTip("헤드 화면에 9칸 격자와 검출된 손 표시")
+        fl.addRow(self.cb_preview)
+        self.l_head = QLabel(); self.l_head.setStyleSheet("color:#f0883e;font-family:monospace;")
+        fl.addRow("시선 자세:", self.l_head)
+        hb = QHBoxLayout()
+        b1 = QPushButton("헤드 저장"); b1.clicked.connect(self._save_head)
+        b1.setToolTip("현재 헤드 자세를 핸드오버 시선 자세로 저장")
+        b2 = QPushButton("시선으로 이동"); b2.clicked.connect(lambda: self._set_head(*self.cfg["head"]))
+        hb.addWidget(b1); hb.addWidget(b2); fl.addRow(hb)
+
+        self.cb_arm = QComboBox(); self.cb_arm.addItems(["left", "right"])
+        self.cb_arm.currentIndexChanged.connect(self._refresh)
+        fl.addRow("팔:", self.cb_arm)
+        grid = QWidget(); gl = QVBoxLayout(grid); gl.setSpacing(2); gl.setContentsMargins(0, 0, 0, 0)
+        self.cell_btns = {}
+        for r in range(1):  # 위 줄(0,*)만 사용 — 손을 내밀 수 있는 위치. 나머지 줄은 기본 칸 0,1로 전달
+            row = QHBoxLayout(); row.setSpacing(2)
+            for c in range(3):
+                b = QPushButton(f"{r},{c}"); b.setFixedHeight(28)
+                b.clicked.connect(lambda _, rc=(r, c): self._select(rc))
+                row.addWidget(b); self.cell_btns[(r, c)] = b
+            gl.addLayout(row)
+        fl.addRow("칸 (화면 기준):", grid)
+        hint = QLabel("가운데·아래 줄 / 미저장 칸 / 손 미검출 → 0,1"); hint.setWordWrap(True)
+        hint.setStyleSheet("color:#8b949e;font-size:11px;")
+        fl.addRow(hint)
+        bb = QHBoxLayout()
+        b3 = QPushButton("현재 자세 저장"); b3.clicked.connect(self._save_pose)
+        b3.setToolTip("선택한 팔·칸에 지금 팔 자세를 저장 (도구를 쥔 상태로)")
+        b4 = QPushButton("삭제"); b4.clicked.connect(self._delete_pose)
+        bb.addWidget(b3); bb.addWidget(b4); fl.addRow(bb)
+        b5 = QPushButton("선택 칸으로 이동 (테스트)"); b5.clicked.connect(self._test_pose)
+        fl.addRow(b5)
+        self.l_info = QLabel(); self.l_info.setWordWrap(True)
+        self.l_info.setStyleSheet("color:#8b949e;font-size:11px;")
+        fl.addRow(self.l_info)
+        self._refresh()
+
+    def _save(self):
+        with open(self._path, "w") as f:
+            json.dump(self.cfg, f, indent=2)
+
+    def _save_head(self):
+        self.cfg["head"] = list(self._get_head()); self._save(); self._refresh()
+        self._status(f"핸드오버 시선 자세 저장: pan {self.cfg['head'][0]:.1f}, tilt {self.cfg['head'][1]:.1f}")
+
+    def _select(self, rc):
+        self.cell = rc; self._refresh()
+
+    def _save_pose(self):
+        obs = self._get_obs()
+        if not obs:
+            self._status("관측 데이터 없음 (연결 확인)"); return
+        arm, key = self.cb_arm.currentText(), f"{self.cell[0]},{self.cell[1]}"
+        self.cfg[arm][key] = _obs_to_locked_action(obs); self._save(); self._refresh()
+        self._status(f"핸드오버 자세 저장: {arm} 팔, 칸 {key}")
+
+    def _delete_pose(self):
+        arm, key = self.cb_arm.currentText(), f"{self.cell[0]},{self.cell[1]}"
+        if self.cfg[arm].pop(key, None) is not None:
+            self._save(); self._refresh(); self._status(f"삭제: {arm} 팔, 칸 {key}")
+
+    def _test_pose(self):
+        arm = self.cb_arm.currentText()
+        key = nearest_saved_cell(self.cfg[arm], self.cell)
+        if key is None:
+            self._status(f"{arm} 팔에 저장된 자세 없음"); return
+        self._move_to(self.cfg[arm][key])
+        self._status(f"{arm} 팔 칸 {key} 자세로 이동 (🛑 긴급 정지로 해제)")
+
+    DEFAULT_CELL = (0, 1)
+
+    def pose_for(self, arm, cell):
+        """저장된 칸이면 그 자세, 아니면(가운데·아래 줄·미저장·손 미검출 cell=None) 0,1 자세.
+        0,1도 없으면 가장 가까운 저장 칸."""
+        saved = self.cfg.get(arm, {})
+        if cell is not None and f"{cell[0]},{cell[1]}" in saved:
+            key = f"{cell[0]},{cell[1]}"
+        else:
+            key = nearest_saved_cell(saved, self.DEFAULT_CELL)
+        return (key, saved[key]) if key else (None, None)
+
+    def _refresh(self):
+        arm = self.cb_arm.currentText()
+        for rc, b in self.cell_btns.items():
+            saved = f"{rc[0]},{rc[1]}" in self.cfg[arm]
+            sel = rc == self.cell
+            b.setStyleSheet(f"QPushButton{{background:{'#238636' if saved else '#30363d'};color:white;"
+                            f"border:{'2px solid #f0883e' if sel else '1px solid #484f58'};border-radius:3px;}}")
+        self.l_head.setText(f"pan={self.cfg['head'][0]:.1f}, tilt={self.cfg['head'][1]:.1f}")
+        dk = f"{self.DEFAULT_CELL[0]},{self.DEFAULT_CELL[1]}"
+        miss = [a for a in ("left", "right") if dk not in self.cfg[a]]
+        self.l_info.setText(f"저장된 칸 — left {len(self.cfg['left'])}/3, right {len(self.cfg['right'])}/3 (초록 = 저장됨)"
+                            + (f"\n⚠️ 기본 칸 {dk} 미저장: {', '.join(miss)}" if miss else ""))
+
+    def overlay_boxes(self, w=640, h=480, target=None):
+        boxes = []
+        for r in range(3):
+            for c in range(3):
+                x1, y1 = c * w // 3, r * h // 3
+                on = target == (r, c)
+                boxes.append({"x1": x1 + 1, "y1": y1 + 1, "x2": x1 + w // 3 - 1, "y2": y1 + h // 3 - 1,
+                              "label": f"{r},{c}" if r == 0 else "->0,1",
+                              "color": (60, 140, 255) if on else (120, 120, 120) if r == 0 else (70, 70, 70)})
+        hand = self.last_hand if time.time() - self.last_hand_t < 0.5 else None
+        if hand:
+            x1, y1, x2, y2 = hand["box"]
+            boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "label": "hand", "color": (255, 220, 0)})
+            boxes.append({"x1": hand["cx"] - 4, "y1": hand["cy"] - 4, "x2": hand["cx"] + 4, "y2": hand["cy"] + 4,
+                          "label": "", "color": (255, 60, 60)})
+        return boxes
+
+
+class AlignGuide(QGroupBox):
+    """정렬 가이드: 학습 데이터의 head camera 시작 화면을 현재 화면에 겹쳐 보여주고,
+    트레이 영역의 어긋남(px)을 phase correlation으로 계산해 표시한다.
+
+    기준 이미지는 Pick 데이터셋 여러 episode의 첫 프레임 중앙값(median)으로 만든다.
+    모델이 위치를 외워서 동작하므로, 로봇/트레이 위치를 녹화 때와 맞추는 용도.
+    """
+    ref_ready = pyqtSignal(bool, str)
+    TOL_PX = 5          # 이 이내면 "정렬됨"
+    TRAY_ROWS = 0.6     # 비교에 쓰는 화면 위쪽 비율 (아래쪽 팔/그리퍼 제외)
+
+    def __init__(self, ref_path, cam, get_repo, get_head, status):
+        super().__init__("정렬 가이드")
+        self.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
+        self._ref_path = ref_path
+        self._cam = cam
+        self._get_repo = get_repo
+        self._get_head = get_head
+        self._status = status
+        self._ref = None
+        self._ref_head_pose = (-4.0, 70.0)
+        self._n = 0
+        self.ref_ready.connect(self._on_ref_ready)
+
+        fl = QFormLayout(self); fl.setSpacing(4)
+        self.cb_on = QCheckBox("학습 화면 겹쳐 보기"); self.cb_on.toggled.connect(self._apply)
+        fl.addRow(self.cb_on)
+        self.cb_diff = QCheckBox("차이만 보기"); self.cb_diff.toggled.connect(self._apply)
+        self.cb_diff.setToolTip("현재 화면과 학습 화면의 차이만 표시 (어긋난 곳이 밝게)")
+        fl.addRow(self.cb_diff)
+        self.sl_alpha = QSlider(Qt.Horizontal); self.sl_alpha.setRange(10, 90); self.sl_alpha.setValue(50)
+        self.sl_alpha.valueChanged.connect(self._apply)
+        fl.addRow("투명도:", self.sl_alpha)
+        self.l_shift = QLabel("—"); self.l_shift.setWordWrap(True)
+        self.l_shift.setStyleSheet("color:#8b949e;font-family:monospace;")
+        fl.addRow(self.l_shift)
+        self.btn_make = QPushButton("기준 화면 만들기 (데이터셋에서)")
+        self.btn_make.clicked.connect(self._make_reference)
+        fl.addRow(self.btn_make)
+        self._load_reference()
+
+    # ── reference image ──
+    def _load_reference(self):
+        img = cv2.imread(self._ref_path) if os.path.exists(self._ref_path) else None
+        self._ref = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None
+        self.btn_make.setText("기준 화면 다시 만들기" if self._ref is not None else "기준 화면 만들기 (데이터셋에서)")
+        if self._ref is None:
+            self.l_shift.setText("기준 화면 없음 — 아래 버튼으로 생성")
+        self._apply()
+
+    def _make_reference(self):
+        if not LEROBOT_OK:
+            self._status("lerobot 데이터셋 모듈을 불러올 수 없음"); return
+        repo = self._get_repo()
+        self.btn_make.setEnabled(False)
+        self._status(f"기준 화면 생성 중... ({repo}, 수십 초 소요)")
+
+        def _work():
+            try:
+                ds = LeRobotDataset(repo)
+                n_ep = ds.meta.total_episodes
+                eps = np.linspace(0, n_ep - 1, min(15, n_ep)).astype(int)
+                frames = []
+                for e in eps:
+                    f = ds[int(ds.meta.episodes[int(e)]["dataset_from_index"])]
+                    frames.append((f["observation.images.head"].permute(1, 2, 0).numpy() * 255).astype(np.uint8))
+                ref = np.median(np.stack(frames), axis=0).astype(np.uint8)  # RGB
+                cv2.imwrite(self._ref_path, cv2.cvtColor(ref, cv2.COLOR_RGB2BGR))
+                self.ref_ready.emit(True, f"기준 화면 저장: {len(frames)}개 episode 시작 프레임의 중앙값")
+            except Exception as e:
+                self.ref_ready.emit(False, f"기준 화면 생성 실패: {e}")
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_ref_ready(self, ok, msg):
+        self.btn_make.setEnabled(True)
+        self._status(msg)
+        if ok:
+            self._load_reference()
+
+    # ── overlay + shift ──
+    def _apply(self):
+        on = self.cb_on.isChecked() and self._ref is not None
+        self._cam.ref_overlay = self._ref if on else None
+        self._cam.ref_diff = self.cb_diff.isChecked()
+        self._cam.ref_alpha = self.sl_alpha.value() / 100.0
+
+    def on_frame(self, head_b64):
+        """_on_obs에서 매 프레임 호출. 계산은 10프레임마다 (약 0.3초)."""
+        if not self.cb_on.isChecked() or self._ref is None:
+            return
+        self._n += 1
+        if self._n % 10:
+            return
+        live = _decode_b64_image(head_b64)
+        if live is None or live.shape != self._ref.shape:
+            return
+        pan, tilt = self._get_head()
+        if abs(pan - self._ref_head_pose[0]) > 0.5 or abs(tilt - self._ref_head_pose[1]) > 0.5:
+            self.l_shift.setText(f"헤드 자세가 녹화 때와 다름 (pan {pan:.1f}, tilt {tilt:.1f})\n"
+                                 f"→ pan {self._ref_head_pose[0]}, tilt {self._ref_head_pose[1]}로 맞춘 뒤 비교")
+            self.l_shift.setStyleSheet("color:#d29922;font-family:monospace;")
+            return
+        h = int(live.shape[0] * self.TRAY_ROWS)
+        g = lambda x: cv2.cvtColor(x[:h], cv2.COLOR_RGB2GRAY).astype(np.float32)
+        win = cv2.createHanningWindow((live.shape[1], h), cv2.CV_32F)
+        (dx, dy), resp = cv2.phaseCorrelate(g(self._ref), g(live), win)  # +dx: 화면 속 트레이가 오른쪽, +dy: 아래
+        ok = abs(dx) <= self.TOL_PX and abs(dy) <= self.TOL_PX
+        lr = "오른쪽" if dx > 0 else "왼쪽"
+        ud = "아래" if dy > 0 else "위"
+        hint = "정렬됨 ✓" if ok else (f"화면 속 트레이가 기준보다 {lr} {abs(dx):.0f}px, {ud} {abs(dy):.0f}px\n"
+                                      f"→ 트레이를 {'왼쪽' if dx > 0 else '오른쪽'}·{'뒤(로봇 반대쪽)' if dy > 0 else '앞(로봇 쪽)'}으로 옮기거나 로봇 위치 조정")
+        self.l_shift.setText(f"dx {dx:+.1f}px  dy {dy:+.1f}px  (신뢰도 {resp:.2f})\n{hint}")
+        self.l_shift.setStyleSheet(f"color:{'#7ee787' if ok else '#d29922'};font-family:monospace;")
+
+
 class ClassifierCapture(QGroupBox):
     """손잡이 분류기 학습 데이터 수집 패널.
 
@@ -623,7 +1041,7 @@ class ClassifierCapture(QGroupBox):
         self._status = status
         self._load_config()
 
-        fl = QFormLayout(self); fl.setSpacing(4)
+        fl = QFormLayout(self); fl.setSpacing(4); fl.setRowWrapPolicy(QFormLayout.WrapLongRows)
         self.f_dir = QLineEdit(os.path.expanduser("~/xlerobot_classifier_data"))
         fl.addRow("저장 폴더:", self.f_dir)
 
@@ -631,15 +1049,16 @@ class ClassifierCapture(QGroupBox):
         self.l_scan = QLabel(); self.l_scan.setStyleSheet("color:#f0883e;font-family:monospace;")
         fl.addRow("스캔 자세:", self.l_scan)
         hb = QHBoxLayout()
-        b_save_pose = QPushButton("현재 자세 저장"); b_save_pose.clicked.connect(self._save_scan_pose)
-        b_goto_pose = QPushButton("스캔 자세로 이동"); b_goto_pose.clicked.connect(self._goto_scan_pose)
+        b_save_pose = QPushButton("자세 저장"); b_save_pose.clicked.connect(self._save_scan_pose)
+        b_goto_pose = QPushButton("스캔 자세로"); b_goto_pose.clicked.connect(self._goto_scan_pose)
         hb.addWidget(b_save_pose); hb.addWidget(b_goto_pose)
         fl.addRow(hb)
 
         # 슬롯 영역 (ROI)
-        self.cb_show = QCheckBox("헤드 화면에 슬롯 영역 표시"); self.cb_show.setChecked(True)
+        self.cb_show = QCheckBox("슬롯 영역 표시"); self.cb_show.setChecked(True)
         fl.addRow(self.cb_show)
-        self.cb_edit = QCheckBox("영역 편집 (헤드 화면에서 드래그)")
+        self.cb_edit = QCheckBox("영역 편집")
+        self.cb_edit.setToolTip("체크 후 헤드 화면에서 선택한 슬롯의 손잡이 영역을 드래그")
         self.cb_edit.toggled.connect(self._toggle_edit)
         self.sp_slot = QSpinBox(); self.sp_slot.setRange(1, self.N_SLOTS)
         eh = QHBoxLayout(); eh.addWidget(self.cb_edit); eh.addWidget(QLabel("슬롯")); eh.addWidget(self.sp_slot)
@@ -805,6 +1224,7 @@ class MainWindow(QMainWindow):
         self.signals.status_changed.connect(lambda m: self.statusBar().showMessage(m))
         self.signals.policy_loaded.connect(self._on_policy_loaded)
         self.signals.voice_done.connect(self._on_voice_done)
+        self.signals.cls_loaded.connect(lambda ok, m: self.l_vr_cls.setText(m))
         self.ctrl = None
         self.policy = None
         self.preprocessor = None
@@ -908,6 +1328,9 @@ class MainWindow(QMainWindow):
             l = QLabel("—"); l.setStyleSheet("color:#7ee787;font-family:monospace;font-size:11px;")
             afl.addRow(short+":", l); self.arm_lbls[key] = l
         sl.addWidget(ag)
+
+        # 정렬 가이드 (학습 데이터 head 화면 겹치기) — cam_head는 아래에서 만들어지므로 나중에 연결
+        self._align_layout = sl
         sl.addStretch()
         tabs_l.addTab(ctrl_scroll, "조종")
 
@@ -948,6 +1371,26 @@ class MainWindow(QMainWindow):
         # 데모 시퀀스
         dg = QGroupBox("데모 시퀀스"); dg.setStyleSheet("QGroupBox{color:#58a6ff;font-weight:bold;}")
         dfl = QVBoxLayout(dg); dfl.setSpacing(4)
+        # Verify & Recover: 요청 도구 → 트레이 스캔 → 실제 슬롯 → instruction remapping
+        vr_form = QFormLayout(); vr_form.setSpacing(4); vr_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.cb_vr_method = QComboBox()
+        self.cb_vr_method.addItems(["Proposed (V&R)", "Baseline", "Task 직접 입력"])
+        self.cb_vr_method.setToolTip("Proposed: 트레이 스캔 → 실제 슬롯 → instruction remapping\nBaseline: 요청 도구 이름 그대로\nTask 직접 입력: AI Task 칸의 문장 사용")
+        vr_form.addRow("방법:", self.cb_vr_method)
+        self.cb_vr_tool = QComboBox(); self.cb_vr_tool.addItems(TRAY_LAYOUT)
+        vr_form.addRow("요청 도구:", self.cb_vr_tool)
+        dfl.addLayout(vr_form)
+        self.btn_vr_scan = QPushButton("🔍 트레이 스캔")
+        self.btn_vr_scan.setStyleSheet("QPushButton{background:#6e7681;color:white;padding:6px;border-radius:4px;}")
+        self.btn_vr_scan.clicked.connect(lambda: self._vr_scan_then(None))
+        dfl.addWidget(self.btn_vr_scan)
+        self.l_vr_cls = QLabel("분류기: 로드 중...")
+        self.l_vr_cls.setStyleSheet("color:#8b949e;font-size:11px;")
+        dfl.addWidget(self.l_vr_cls)
+        self.l_vr_result = QLabel("")
+        self.l_vr_result.setWordWrap(True)
+        self.l_vr_result.setStyleSheet("color:#8b949e;font-family:monospace;font-size:11px;")
+        dfl.addWidget(self.l_vr_result)
         rot_row = QHBoxLayout()
         self.f_rotate_target = QLineEdit("-90")
         self.f_rotate_target.setFixedWidth(50)
@@ -965,9 +1408,16 @@ class MainWindow(QMainWindow):
         self.btn_run_handoff.setStyleSheet("QPushButton{background:#6e7681;color:white;padding:6px;border-radius:4px;}")
         self.btn_run_handoff.clicked.connect(lambda: self._run_handoff())
         dfl.addWidget(self.btn_run_handoff)
+        self.cb_hand_guided = QCheckBox("손 위치 기반 핸드오버")
+        self.cb_hand_guided.setToolTip("헤드 화면 9칸에서 손을 찾아 그 칸의 자세로 전달 (자세는 핸드오버 탭에서 설정)")
+        self.cb_hand_guided.setChecked(True)
+        dfl.addWidget(self.cb_hand_guided)
+        self.cb_pick_only = QCheckBox("집기까지만 (실험 04)")
+        self.cb_pick_only.setToolTip("집기 + 자세 고정에서 멈춤 (회전·전달 생략). 🛑 긴급 정지로 해제")
+        dfl.addWidget(self.cb_pick_only)
         self.btn_demo = QPushButton("▶ 전체 데모 시작")
         self.btn_demo.setStyleSheet("QPushButton{background:#da3633;color:white;padding:8px;border-radius:4px;font-weight:bold;}")
-        self.btn_demo.clicked.connect(lambda: self._start_demo_sequence())
+        self.btn_demo.clicked.connect(lambda: self._request_and_run(self.cb_vr_tool.currentText()))
         dfl.addWidget(self.btn_demo)
         self.btn_estop = QPushButton("🛑 긴급 정지")
         self.btn_estop.setStyleSheet("QPushButton{background:#67060c;color:white;padding:10px;border-radius:4px;font-weight:bold;font-size:13px;}QPushButton:hover{background:#8b1118;}")
@@ -1024,8 +1474,37 @@ class MainWindow(QMainWindow):
             self._set_head_pose,
             status)
         rl2.addWidget(self.cls_capture)
+
+        self.align_guide = AlignGuide(
+            os.path.expanduser("~/xlerobot-teleop/desktop/align_reference_head.png"),
+            self.cam_head,
+            lambda: self.rec_pick.f_repo.text(),
+            lambda: (self.head_pan, self.head_tilt),
+            status)
+        self._align_layout.insertWidget(self._align_layout.count() - 1, self.align_guide)  # stretch 앞에
+
+        self.handle_cls = HandleClassifier(os.path.expanduser(
+            "~/xlerobot_classifier_data/models/handle_classifier_resnet18_color.pt"))
+        self.handle_cls.load_async(lambda ok, m: self.signals.cls_loaded.emit(ok, m))
         rl2.addStretch()
         tabs_r.addTab(cls_scroll, "분류기")
+
+        ho_scroll, rl2 = self._tab_page()
+        self.hand_detector = HandDetector(os.path.expanduser("~/xlerobot-teleop/desktop/hand_landmarker.task"))
+        self.handover_panel = HandoverPanel(
+            os.path.expanduser("~/xlerobot-teleop/desktop/handover_poses.json"),
+            lambda: self.ctrl._latest_obs if self.ctrl else None,
+            lambda: (self.head_pan, self.head_tilt),
+            self._set_head_pose,
+            self._move_to_pose_test,
+            status)
+        rl2.addWidget(self.handover_panel)
+        rl2.addStretch()
+        tabs_r.addTab(ho_scroll, "핸드오버")
+        self._ho_tab = ho_scroll
+        self._handover_detecting = False
+        self._handover_target = None
+        self._hand_frame_n = 0
         self._cls_tab = cls_scroll
         self._tabs_r = tabs_r
         # 탭을 벗어나면 영역 편집(드래그)도 끔 — 다른 작업 중 헤드 화면 클릭으로 영역이 바뀌지 않도록
@@ -1140,10 +1619,10 @@ class MainWindow(QMainWindow):
 
     def _on_voice_done(self, ok, text, canonical):
         if ok:
-            task = f"Pick up the {TOOL_TASK_NAMES[canonical]}"
-            self.f_ai_task.setText(task)
             self.l_voice_status.setText(f'"{text}" → {canonical} → 데모 시퀀스 시작')
-            self._start_demo_sequence()
+            if self.cb_vr_method.currentIndex() == 2:  # Task 직접 입력 모드에서도 음성은 기존처럼 동작
+                self.cb_vr_method.setCurrentIndex(1)
+            self._request_and_run(canonical)
         else:
             self.l_voice_status.setText(f'매칭 실패: "{text}"')
 
@@ -1222,21 +1701,54 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(interval_ms, _check)
 
-    def _run_handoff(self, move_duration_s=2.5, hold_s=3.0, release_s=1.0, token=None, on_done=None):
+    def _move_scripted(self, target, duration_s, token, on_done, step_ms=33):
+        """현재 scripted 자세(없으면 현재 관절 상태)에서 target까지 duration_s 동안 부드럽게 보간 이동."""
+        obs = self.ctrl._latest_obs or {}
+        start = dict(self.ctrl.scripted_action) if self.ctrl.scripted_action else _obs_to_locked_action(obs)
+        keys = [k for k in target if k in start]
+        n = max(1, int(duration_s * 1000 / step_ms))
+        state = {"i": 0}
+
+        def _step():
+            if token is not None and token != self._demo_token:
+                return
+            state["i"] += 1
+            u = min(1.0, state["i"] / n)
+            u = u * u * (3 - 2 * u)  # smoothstep: 출발·도착을 천천히
+            pose = dict(target)
+            for k in keys:
+                pose[k] = start[k] + (target[k] - start[k]) * u
+            self.ctrl.scripted_action = pose
+            if state["i"] < n:
+                QTimer.singleShot(step_ms, _step)
+            elif on_done:
+                on_done()
+
+        _step()
+
+    def _run_handoff(self, move_duration_s=4.0, hold_s=1.0, release_s=1.0, return_s=4.0,
+                     token=None, on_done=None, return_pose=None, pose=None, arm=None):
+        """핸드오프 자세로 천천히 이동 → hold_s 후 그리퍼 열기 → release_s 대기 → return_pose로 천천히 복귀.
+        pose가 없으면 고정 핸드오프 자세 파일을 사용. arm이 주어지면 그 팔의 그리퍼만 연다."""
         if not self.ctrl or not self.ctrl.running:
             self.statusBar().showMessage("먼저 로봇에 연결하세요")
             return
-        try:
-            with open(self._handoff_pose_path) as f:
-                pose = json.load(f)
-        except Exception as e:
-            self.statusBar().showMessage(f"핸드오프 자세 로드 실패: {e} (먼저 '핸드오프 자세 저장' 필요)")
-            return
-        self.ctrl.scripted_action = dict(pose)
+        if pose is None:
+            try:
+                with open(self._handoff_pose_path) as f:
+                    pose = json.load(f)
+            except Exception as e:
+                self.statusBar().showMessage(f"핸드오프 자세 로드 실패: {e} (먼저 '핸드오프 자세 저장' 필요)")
+                return
+        if return_pose is None:  # 단독 실행: 시작했던 자세로 돌아감
+            return_pose = _obs_to_locked_action(self.ctrl._latest_obs or {})
+        if token is None:
+            self._demo_token += 1
+            token = self._demo_token
         self.l_demo_status.setText("핸드오프: 이동 중...")
 
         def _cancelled():
-            return token is not None and token != self._demo_token
+            return token != self._demo_token
 
         def _arrived():
             if _cancelled():
@@ -1248,12 +1760,19 @@ class MainWindow(QMainWindow):
             if _cancelled():
                 return
             release_pose = dict(pose)
-            for gkey in ("left_arm_gripper.pos", "right_arm_gripper.pos"):
+            gkeys = [f"{arm}_arm_gripper.pos"] if arm else ["left_arm_gripper.pos", "right_arm_gripper.pos"]
+            for gkey in gkeys:
                 if gkey in release_pose:
                     release_pose[gkey] = 100.0 if release_pose[gkey] < 50.0 else 0.0
             self.ctrl.scripted_action = release_pose
             self.l_demo_status.setText("핸드오프: 놓는 중...")
-            QTimer.singleShot(int(release_s * 1000), _finish)
+            QTimer.singleShot(int(release_s * 1000), _go_back)
+
+        def _go_back():
+            if _cancelled():
+                return
+            self.l_demo_status.setText("핸드오프: 원래 자리로 복귀 중...")
+            self._move_scripted(return_pose, return_s, token, _finish)
 
         def _finish():
             if _cancelled():
@@ -1264,7 +1783,141 @@ class MainWindow(QMainWindow):
             if on_done:
                 on_done()
 
-        QTimer.singleShot(int(move_duration_s * 1000), _arrived)
+        self._move_scripted(pose, move_duration_s, token, _arrived)
+
+    # ── Verify & Recover ──────────────────────────────
+    VR_CONF_THR = 0.8
+    VR_LOG = os.path.expanduser("~/xlerobot_experiment_log.jsonl")
+
+    def _vr_scan_then(self, on_preds, settle_s=0.8):
+        """헤드를 스캔 자세로 보내고 잠시 기다린 뒤 head 이미지 1장을 분류. on_preds(preds) 콜백."""
+        if not self.ctrl or not self.ctrl.running:
+            self.statusBar().showMessage("먼저 로봇에 연결하세요"); return
+        if self.handle_cls.model is None:
+            self.statusBar().showMessage("분류기가 아직 로드되지 않음"); return
+        cc = self.cls_capture
+        moved = abs(self.head_pan - cc.scan_pan) > 0.5 or abs(self.head_tilt - cc.scan_tilt) > 0.5
+        self._set_head_pose(cc.scan_pan, cc.scan_tilt)
+        token = self._demo_token
+        self.l_vr_result.setText("트레이 스캔 중...")
+
+        def _do():
+            if token != self._demo_token:
+                return
+            img = _decode_b64_image(self._latest_head_b64)
+            if img is None:
+                self.l_vr_result.setText("헤드 카메라 이미지 없음"); return
+            preds = self.handle_cls.classify(img, cc.rois)
+            self._vr_last = {"preds": preds, "time": time.time(), "target": None}
+            self.l_vr_result.setText("트레이: " + "  ".join(
+                f"{i+1}:{l[:4]}{'' if c >= self.VR_CONF_THR else '?'}" for i, (l, c) in enumerate(preds)))
+            if on_preds:
+                on_preds(preds)
+
+        QTimer.singleShot(int((settle_s + (1.0 if moved else 0.0)) * 1000), _do)
+
+    def _vr_overlay_boxes(self):
+        """마지막 스캔 결과를 8초간 head 화면에 표시 (목표 슬롯은 파랑)."""
+        last = getattr(self, "_vr_last", None)
+        if not last or time.time() - last["time"] > 8:
+            return None
+        boxes = []
+        for i, ((l, c), r) in enumerate(zip(last["preds"], self.cls_capture.rois)):
+            if last["target"] == i + 1:
+                color = (60, 140, 255)
+            elif c < self.VR_CONF_THR:
+                color = (255, 60, 60)
+            elif l != TRAY_LAYOUT[i]:
+                color = (255, 170, 0)   # 원래 자리가 아닌 도구
+            else:
+                color = (0, 255, 0)
+            boxes.append({"x1": r[0], "y1": r[1], "x2": r[2], "y2": r[3], "label": f"{l[:4]} {c:.2f}", "color": color})
+        return boxes
+
+    def _vr_log(self, rec):
+        try:
+            with open(self.VR_LOG, "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def _request_and_run(self, requested):
+        """요청 도구 → (방법에 따라) 스캔·판단 → instruction 설정 → 데모 시퀀스."""
+        mode = self.cb_vr_method.currentIndex()
+        if mode == 2:  # Task 직접 입력: 기존 동작
+            self._start_demo_sequence(); return
+        self.cb_vr_tool.setCurrentText(requested)
+        method = "proposed" if mode == 0 else "baseline"
+        base = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "method": method, "requested": requested}
+
+        def _decide(preds):
+            d = verify_and_recover(requested, preds, method, self.VR_CONF_THR)
+            self._vr_log({**base, "preds": preds, **d})
+            if d["instruction"] is None:
+                self.l_vr_result.setText(self.l_vr_result.text() + f"\n⚠️ 중단: {d['reason']}")
+                self.l_demo_status.setText(f"⚠️ {d['reason']} — 의사에게 알림")
+                self.statusBar().showMessage(f"Verify & Recover 중단: {d['reason']}")
+                return
+            if preds is not None:
+                self._vr_last["target"] = d["slot"]
+                self.l_vr_result.setText(self.l_vr_result.text() +
+                                         f"\n{d['status']}: {d['reason']}\n→ \"{d['instruction']}\" ({d['arm']})")
+            else:
+                self.l_vr_result.setText(f"baseline → \"{d['instruction']}\"")
+            self.f_ai_task.setText(d["instruction"])
+            self._start_demo_sequence()
+
+        if method == "baseline":
+            _decide(None)
+        else:
+            self._vr_scan_then(_decide)
+
+    HAND_STABLE_N = 5        # 같은 칸에서 연속 검출 횟수 (≈0.5 s)
+    HAND_TIMEOUT_S = 5.0     # 이 시간 안에 손이 확정되지 않으면 기본 칸(0,1) 자세로 전달
+
+    def _hand_guided_handoff(self, token, home_pose, arm, on_done):
+        """시선 자세로 헤드 이동 → 손 검출 → 손이 있는 칸 확정 → 도구를 든 팔의 그 칸 자세로 핸드오버."""
+        hp = self.handover_panel
+        if arm is None:
+            arm = "left"
+        self._set_head_pose(*hp.cfg["head"])
+        st = {"cell": None, "n": 0, "t0": time.time()}
+        self._handover_detecting = True
+
+        def _finish_all():
+            self._handover_target = None
+            cc = self.cls_capture
+            self._set_head_pose(cc.scan_pan, cc.scan_tilt)  # 다음 집기를 위해 헤드를 원래 자세로
+            on_done()
+
+        def _handover_to(cell):
+            self._handover_detecting = False
+            key, pose = hp.pose_for(arm, cell)
+            if pose is None:
+                self.l_demo_status.setText(f"⚠️ {arm} 팔 핸드오버 자세가 없음 — 고정 핸드오프 자세 사용")
+            else:
+                self._handover_target = tuple(map(int, key.split(",")))
+            where = f"손 위치 {cell[0]},{cell[1]}" if cell else "손 미검출"
+            self.l_demo_status.setText(f"4/4 핸드오버: {arm} 팔 → 칸 {key or '고정'} ({where})")
+            self._run_handoff(token=token, return_pose=home_pose, pose=pose, arm=arm, on_done=_finish_all)
+
+        def _poll():
+            if token != self._demo_token:
+                self._handover_detecting = False; return
+            elapsed = time.time() - st["t0"]  # 실제 경과 시간 (타이머 간격은 부하에 따라 늘어남)
+            hand = hp.last_hand if time.time() - hp.last_hand_t < 0.3 else None
+            if hand and elapsed > 1.0:  # 헤드가 시선 자세로 움직이는 동안은 무시
+                cell = grid_cell(hand["cx"], hand["cy"], 640, 480)
+                st["n"] = st["n"] + 1 if cell == st["cell"] else 1
+                st["cell"] = cell
+                self.l_demo_status.setText(f"4/4 손 검출: 칸 {cell[0]},{cell[1]} ({st['n']}/{self.HAND_STABLE_N})")
+                if st["n"] >= self.HAND_STABLE_N:
+                    _handover_to(cell); return
+            if elapsed > 1.0 + self.HAND_TIMEOUT_S:
+                _handover_to(None); return
+            QTimer.singleShot(100, _poll)
+
+        _poll()
 
     def _start_demo_sequence(self, grip_lock_s=1.0):
         if not self.ctrl or not self.ctrl.running:
@@ -1275,6 +1928,8 @@ class MainWindow(QMainWindow):
             return
         self._demo_token += 1
         token = self._demo_token
+        home_pose = _obs_to_locked_action(self.ctrl._latest_obs or {})  # 핸드오프 후 돌아올 자세
+        arm = arm_from_instruction(self.f_ai_task.text())  # 도구를 드는 팔 (remap된 instruction이면 실제 slot 기준)
         self.l_demo_status.setText("1/4 집는 중... (움직임이 멈출 때까지 대기)")
         if not self.ctrl.ai_mode:
             self._toggle_ai_mode()
@@ -1290,6 +1945,10 @@ class MainWindow(QMainWindow):
             obs = self.ctrl._latest_obs or {}
             lock_pose = _obs_to_locked_action(obs)
             self.ctrl.scripted_action = lock_pose
+            if self.cb_pick_only.isChecked():
+                # 실험 04: 집은 자세를 고정한 채로 멈춤 (결과 확인용). 🛑 긴급 정지로 고정 해제.
+                self.l_demo_status.setText("집기 완료 — 자세 고정 중. 결과 기록 후 🛑 긴급 정지로 해제")
+                return
             QTimer.singleShot(int(grip_lock_s * 1000), _start_rotate)
 
         def _start_rotate():
@@ -1306,14 +1965,21 @@ class MainWindow(QMainWindow):
             if self.auto_rotate_active:
                 QTimer.singleShot(200, _wait_rotate)
                 return
-            self.l_demo_status.setText("4/4 핸드오프 중...")
-            self._run_handoff(token=token, on_done=lambda: self.l_demo_status.setText("데모 완료 ✓"))
+            done = lambda: self.l_demo_status.setText("데모 완료 ✓")
+            if self.cb_hand_guided.isChecked():
+                self.l_demo_status.setText("4/4 손 찾는 중...")
+                self._hand_guided_handoff(token, home_pose, arm, done)
+            else:
+                self.l_demo_status.setText("4/4 핸드오프 중...")
+                self._run_handoff(token=token, return_pose=home_pose, arm=arm, on_done=done)
 
         self._wait_for_settle(token, self._get_arm_pos_vec, _on_pick_settled)
 
     def _emergency_stop(self):
         self._demo_token += 1  # invalidate any pending demo-sequence callbacks
         self.auto_rotate_active = False
+        self._handover_detecting = False
+        self._handover_target = None
         if self.ctrl:
             self.ctrl.ai_mode = False
             self.ctrl.scripted_action = None
@@ -1353,6 +2019,12 @@ class MainWindow(QMainWindow):
         self.l_ai_status.setText(msg)
         self.btn_load_policy.setEnabled(True)
         self.btn_ai_mode.setEnabled(ok)
+
+    def _move_to_pose_test(self, pose):
+        if not self.ctrl or not self.ctrl.running:
+            self.statusBar().showMessage("먼저 로봇에 연결하세요"); return
+        self._demo_token += 1
+        self._move_scripted(pose, 4.0, self._demo_token, None)
 
     def _set_head_pose(self, pan, tilt):
         # _tick이 다음 주기에 이 값을 ControlThread로 전송
@@ -1425,7 +2097,22 @@ class MainWindow(QMainWindow):
     def _on_obs(self, obs):
         self._latest_head_b64 = obs.get("head", "")
         cls_tab_open = self._tabs_r.currentWidget() is self._cls_tab
-        self.cam_head.show_frame(self._latest_head_b64, self.cls_capture.overlay_boxes() if cls_tab_open else None)
+        ho_preview = self._tabs_r.currentWidget() is self._ho_tab and self.handover_panel.cb_preview.isChecked()
+        if ho_preview or self._handover_detecting:
+            self._hand_frame_n += 1
+            if self._hand_frame_n % 3 == 0:  # ~10 Hz, 약 20 ms/회 (GUI 스레드)
+                img = _decode_b64_image(self._latest_head_b64)
+                if img is not None:
+                    self.handover_panel.last_hand = self.hand_detector.detect(img)
+                    self.handover_panel.last_hand_t = time.time()
+        if cls_tab_open:
+            boxes = self.cls_capture.overlay_boxes()
+        elif ho_preview or self._handover_detecting or self._handover_target:
+            boxes = self.handover_panel.overlay_boxes(target=self._handover_target)
+        else:
+            boxes = self._vr_overlay_boxes()
+        self.cam_head.show_frame(self._latest_head_b64, boxes)
+        self.align_guide.on_frame(self._latest_head_b64)
         self.cam_left.show_frame(obs.get("left_wrist", ""))
         self.cam_right.show_frame(obs.get("right_wrist", ""))
 

@@ -21,12 +21,16 @@ This is the manipulation/teleop layer for the **Y-MAS 베살리우스 팀** lapa
 - MPU6050 IMU with gyro-bias calibration and accumulated yaw angle (for precise 90° turns)
 - Live per-motor temperature readout (14 motors: both arms + head)
 - Embedded 3D robot pose visualization (matplotlib, simplified forward kinematics)
-- Tabbed control GUI (조종 / AI 모드 on the left, 데이터 / 분류기 / 상태 on the right) instead of one long scrolling sidebar
-- Handle-classifier data capture: fixed scan head pose + per-slot ROI crops with arrangement labels
+- Tabbed control GUI (조종 / AI 모드 on the left, 데이터 / 분류기 / 핸드오버 / 상태 on the right) instead of one long scrolling sidebar
+- **Verify & Recover** (the paper's proposed method): before each pick, scan the tray with a ResNet18 handle classifier; if the requested tool is in another slot, remap the policy instruction to that slot (and pick the arm by slot); stop and alert if it isn't on the tray
+- **Hand-guided handover**: after the 90° turn, MediaPipe finds the surgeon's hand in a 3×3 grid on the head camera and the holding arm moves (slowly) to the pose saved for that cell
+- Handle-classifier data capture (fixed scan head pose + per-slot ROI crops with arrangement labels) and training script (`classifier/train_classifier.py`)
+- Alignment guide: overlay of the training-time head view to put the robot/tray back where the demonstrations were recorded
+- Diagnostics: open-loop replay of a recorded episode (`desktop/replay_episode.py`) and running the policy without the GUI (`desktop/policy_rollout.py`)
 - One-click dataset recording (LeRobotDataset) for imitation learning — separate Pick and Place (tray return) datasets, episode start/save/discard, resumable across sessions, background upload to Hugging Face
 - Ready for **ACT** / **SmolVLA** training via `lerobot-train`
 - Experimental **AI 모드**: run a trained checkpoint directly on the robot from the control GUI (no separate eval script needed)
-- **Voice-triggered demo sequence**: Whisper recognizes a spoken tool name → auto-fills the task prompt → runs the full pick → grip-lock → auto-rotate → handoff sequence, with a manual "▶ 전체 데모 시작" button and a "🛑 긴급 정지" kill switch
+- **Voice-triggered demo sequence**: faster-whisper + alias parser recognizes the spoken tool → Verify & Recover → pick → grip-lock → auto-rotate → hand-guided handover, with a manual "▶ 전체 데모 시작" button and a "🛑 긴급 정지" kill switch
 - Standalone Whisper voice-command test script (`desktop/whisper_test.py`) for mapping spoken tool names to canonical labels
 
 ## Architecture
@@ -61,6 +65,8 @@ xlerobot_control.py               xlerobot_host.py
 |------|-------------|
 | `desktop/xlerobot_control.py` | anywhere (e.g. `~/xlerobot_control.py`) |
 | `desktop/whisper_test.py` | anywhere, standalone (no robot connection needed) |
+| `desktop/replay_episode.py`, `desktop/policy_rollout.py` | next to `xlerobot_control.py` (diagnostics, run with the GUI closed) |
+| `classifier/train_classifier.py` | `~/xlerobot-teleop/classifier/` (the GUI imports its `preprocess()` from there) |
 
 ## Installation
 
@@ -176,6 +182,18 @@ hf auth login
 sudo apt-get install -y portaudio19-dev libportaudio2
 pip install faster-whisper sounddevice
 ```
+
+**8. 손 검출 (MediaPipe, 핸드오버용)**
+
+```bash
+# --no-deps 필수: mediapipe는 opencv-contrib-python을 끌어오는데, opencv-python-headless와 섞이면 PyQt5 GUI가 실행되지 않음
+pip install --no-deps mediapipe==1.1.0
+pip install "absl-py~=2.3"
+curl -L -o ~/xlerobot-teleop/desktop/hand_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+```
+
+`pip`가 "mediapipe requires opencv-contrib-python, which is not installed" 경고를 내지만 의도한 것이다 (손 검출은 headless OpenCV로 동작).
 
 ## Motor Port Mapping
 
@@ -328,22 +346,42 @@ lerobot-train \
 
 The **AI 모드** tab (left side) loads a trained checkpoint and lets it drive both arms directly from the GUI — no separate `lerobot-eval`/`lerobot-record` process needed (XLeRobot's ZMQ host/client split isn't a standard registered lerobot `Robot`, so the usual real-robot eval CLIs don't apply here; this reuses the exact same ZMQ pipeline as teleoperation).
 
-1. Set **체크포인트 경로** to a `pretrained_model` directory (defaults to the current SmolVLA 2-tool checkpoint, `outputs/train/smolvla_2tool/checkpoints/last/pretrained_model`) and **Task 설명** (should match a phrasing used at training time, e.g. `Pick up the grasper`).
+1. Set **체크포인트 경로** to a `pretrained_model` directory (defaults to the 7-tool SmolVLA, `~/lerobot/outputs/train/smolvla_7tool/pretrained_model`) and **Task 설명** (must match a training phrasing exactly, e.g. `Pick up the grasper`, `Pick up the clippers`).
 2. Click **정책 로드** (loads in the background; watch the status line below the button — SmolVLA loading is noticeably slower than ACT).
-3. Once loaded, **AI 모드 시작** hands both arms to the policy — leader-arm input is ignored while active. **AI 모드 중지** returns control to the leader arms.
+3. Once loaded, **AI 모드 시작** hands both arms to the policy — leader-arm input is ignored while active. **AI 모드 중지** returns control to the leader arms. Each start clears the policy's queued action chunk, so stop → start (or changing Task) re-plans from the current observation.
 4. Stay ready to stop the robot (🛑 긴급 정지, or just close the GUI) — an undertrained policy can produce unexpected motion.
 
-### Demo Sequence (pick → rotate → handoff)
+### Demo Sequence (verify → pick → rotate → handover)
 
 Below AI 추론, the **데모 시퀀스** group chains a full "grab the tool and hand it to the surgeon" run:
 
-1. **🎤 음성 명령 듣기** — click to start recording, click again to stop; Whisper transcribes and matches it against `TOOL_ALIASES`, auto-filling **Task 설명** (e.g. `Pick up the grasper`) and immediately kicking off the full sequence below. The tool name in the prompt comes from `TOOL_TASK_NAMES`, which must match the recorded task strings exactly (e.g. Clipper was recorded as `Pick up the clippers`) — update it if you record with different wording. Or trigger it manually with **▶ 전체 데모 시작** after setting Task 설명 yourself.
-2. **Pick** — runs AI 모드 and waits for the arm to *settle* (joint positions stop changing for ~1.2s, with a 3s minimum before it's allowed to declare "done" and a 20s timeout) rather than using a fixed timer, so it doesn't cut the policy off mid-grasp.
-3. **Grip lock** — freezes the arm at its current (just-settled) pose as a `scripted_action`, overriding both AI mode and leader-arm input, so the tool can't be dropped or bumped by stray teleop input during the turn.
-4. **Rotate** — spins the base to **목표 각도** (default `-90`) using IMU yaw feedback, with the grip lock held throughout.
-5. **Handoff** — moves to a pre-recorded **핸드오프 자세** (see below), waits 3s once arrived, opens the gripper, holds 1s, then releases control.
+1. **Request** — **🎤 음성 명령 듣기** (faster-whisper → `TOOL_ALIASES` alias match) or pick **요청 도구** and press **▶ 전체 데모 시작**.
+2. **Verify & Recover** (방법 = `Proposed (V&R)`) — head to the scan pose, classify the 7 slot crops, decide (`verified` / `recovered` / `not_found` / `low_conf`, threshold 0.8) and set the instruction to the *original owner of the slot where the tool actually is* (see below). `Baseline` uses the requested name as-is; `Task 직접 입력` uses the AI Task field.
+3. **Pick** — AI 모드, ending when the arm *settles* (joints still for ~1.2 s after a 3 s minimum, 20 s timeout).
+4. **Grip lock** — freezes the just-settled pose as a `scripted_action` so the tool isn't dropped during the turn. With **집기까지만 (실험 04)** checked the sequence stops here (🛑 긴급 정지 releases).
+5. **Rotate** — base turns to **목표 각도** (default `-90`) with IMU yaw feedback.
+6. **Handover** — with **손 위치 기반 핸드오버** checked: hand-guided (next section); otherwise the single fixed **핸드오프 자세**. Either way the arm moves there over 4 s, waits 1 s, opens only the holding arm's gripper, waits 1 s, returns slowly (4 s) to the pose it had before the pick, and the head goes back to the pick pose.
 
-Before using the full sequence, record a handoff pose once: teleop the arm to a natural "present the tool to the surgeon's hand" position while actually holding something, then click **핸드오프 자세 저장**. **핸드오프 동작 실행** replays just that step standalone (useful for tuning release timing without redoing the whole pick). **자동 회전 시작** likewise works standalone and also grip-locks the current pose before turning.
+**핸드오프 자세 저장 / 핸드오프 동작 실행 / 자동 회전 시작** still work standalone for tuning.
+
+#### Verify & Recover
+
+The 7-tool policy was trained on a fixed layout, so it reads `Pick up the <tool>` as "go to that tool's home slot" (with tools swapped it goes to the original slot 60/60 times). Verify & Recover turns that into a slot command:
+
+```
+requested SCISSORS (home slot 3) → tray scan: slot 3 = CLIPPER, slot 4 = SCISSORS
+→ recovered → instruction "Pick up the clippers" (slot 4's original owner) → left arm (slots 1–4 left, 5–7 right)
+```
+
+Every request is logged to `~/xlerobot_experiment_log.jsonl` (method, requested tool, per-slot predictions + confidence, decision, instruction). After a scan the head view shows each slot's prediction for 8 s (green = home tool, orange = other tool, red = low confidence, blue = target). **🔍 트레이 스캔** runs the scan alone.
+
+#### Hand-guided handover (핸드오버 tab)
+
+- The head camera image is split 3×3; MediaPipe HandLandmarker (~20 ms/frame on CPU, largest hand wins) gives the palm center. A cell is accepted after 5 consecutive detections (~0.5 s).
+- Only the **top row (0,0 / 0,1 / 0,2)** holds poses. Middle/bottom row, an unsaved cell, or no hand within 5 s → the default cell **0,1**.
+- The holding arm comes from the instruction (`arm_from_instruction`: remapped instruction → actual slot → left 1–4 / right 5–7).
+
+Setup once: turn the robot toward the surgeon, check **손 검출 미리보기**, aim the head so the offered hand is in view and press **헤드 저장**; then for each arm select a top-row cell, teleop the arm (holding something) to a comfortable "present the tool" pose and **현재 자세 저장**. **선택 칸으로 이동 (테스트)** moves there slowly (🛑 긴급 정지 releases). Poses live in `desktop/handover_poses.json` (git-ignored).
 
 > ⚠️ `observation.*.gripper.pos` is a raw motor reading, but `xlerobot.py`'s `send_action()` inverts gripper *actions* (`100 - value`) before writing to the motor. Any code that reads a gripper position from an observation and replays it as an action (grip-lock, saved handoff pose) must re-invert it (`100 - value`) first, or the gripper does the opposite of what was intended — see `_obs_to_locked_action()` in `xlerobot_control.py`. If you ever see the gripper open right when it should be holding the tool, this is the first thing to check.
 
@@ -374,6 +412,29 @@ labels.jsonl                   per image: arrangement, arrangement_id, ROIs, hea
 
 Split train/test **by `arrangement_id`**, not by image — shots of the same arrangement in both splits inflate accuracy. Scan pose and ROIs live in `desktop/classifier_config.json` (git-ignored, setup-specific like `handoff_pose.json`).
 
+### Classifier training
+
+```bash
+python classifier/train_classifier.py        # 5-fold CV grouped by arrangement (color + grayscale) + final color model
+```
+
+~20 s per model on an RTX 4060. Saves `~/xlerobot_classifier_data/models/handle_classifier_resnet18_color.pt` (loaded by the GUI at startup) and `cv_results.json`. Results: [`experiments/README.md`](experiments/README.md) §03.
+
+## Alignment Guide (조종 tab)
+
+The policy memorized positions, so the robot and tray must sit where the demonstrations were recorded. **학습 화면 겹쳐 보기** blends the median training start frame (`desktop/align_reference_head.png`, built from the Pick dataset with **기준 화면 만들기**) over the head view and reports the tray shift (phase correlation, top 60 % of the image) — "정렬됨 ✓" within 5 px. **차이만 보기** shows only the differences. Mark the robot wheels and tray corners on the floor; if both are on their marks and the guide still disagrees, check the head camera rather than moving the tray.
+
+## Diagnostics
+
+Run with the GUI closed (they connect to the Jetson host directly):
+
+| Script | What it tells you |
+|---|---|
+| `python3 desktop/replay_episode.py --task grasper` | Replays a recorded successful episode open-loop (no policy) at 30 Hz. If it still grasps, the robot/tool geometry is unchanged and the problem is on the policy-input side |
+| `python3 desktop/policy_rollout.py --task "Pick up the grasper"` | Runs the policy without the GUI at an exact rate (`--hz`). If this works but the GUI doesn't, the problem is in the GUI |
+
+To analyse a failing AI run, record it with the Pick recorder (Repo ID e.g. `bigse0u1/debug_rollout`, AI mode on while recording) — the recorded `action` is the policy's command, so commanded vs. actual joints, camera frames and timing can be compared offline.
+
 ## Voice Command Testing (Whisper)
 
 `desktop/whisper_test.py` is a standalone mic → [faster-whisper](https://github.com/SYSTRAN/faster-whisper) → canonical-tool-name script, useful for prototyping the "의사 음성 요청 → 도구 선택" pipeline before wiring it into the robot.
@@ -401,6 +462,11 @@ Press `ENTER`, say a tool name (Korean or English), press `ENTER` again to stop,
 - The 2-tool SmolVLA checkpoint (`smolvla_2tool`) was trained with `--policy.type=smolvla`, i.e. `load_vlm_weights=False` + `train_expert_only=True` — a randomly initialized, frozen vision-language backbone. This is a likely major cause of it ignoring the language instruction (next item). The 7-tool run fine-tunes from `lerobot/smolvla_base` instead (see Training)
 - SmolVLA fine-tuned on a small (~100 episodes/tool), visually-cluttered scene (7 similar tools together) tends to ignore the language instruction and just grab whatever's nearest rather than the requested tool — language grounding needs either much more data, or (for now) a **fixed tool layout per recording session** rather than randomizing position every episode, since with limited data the model can't reliably learn both position-invariance and language-based tool selection at once
 - Same-color gripper and tool (e.g. both white) removes a cheap visual cue the policy could otherwise use for fine alignment — no software fix for this (augmentation can't invent contrast that isn't in the pixels); mark the gripper fingers with contrasting tape before the next recording round
+- **Start pose matters**: Pick fails almost every time if the arms start with `wrist_roll` off the training start pose (left ≈ −2, right ≈ 5); check 팔 상태 before AI 모드
+- **Intermittent "hovering"** (unresolved): sometimes the policy reaches every tool, keeps the gripper open and hovers without closing. Ruled out with data: model file, prompt, motor tracking, camera latency/freezes, head-camera orientation, lens auto-exposure, the GUI. Open-loop replay still grasps during these periods. It has recovered after touching the head camera, but that may be coincidence — capture a working-state snapshot next time and compare
+- Wrist cameras use `/dev/video6` / `/dev/video8`, which change when a USB camera re-enumerates (the right wrist camera dropped out once and the host failed with "Failed to open OpenCVCamera(/dev/video8)"). TODO: switch `config_xlerobot.py` to `/dev/v4l/by-path/...`
+- The Jetson host exits after `connection_time_s` (3600 s): "Cycle time reached." Restart it for longer sessions
+- `stop_base failed on disconnect ... Port is in use!` on host shutdown: Ctrl+C interrupted a bus transaction. Harmless if the base was already stopped (the 500 ms watchdog does that); don't kill the host while the base is moving
 - The settle-detection used to decide when AI 모드 has "finished" picking (`_wait_for_settle`) can mistake a brief mid-sequence pause (e.g. before the gripper closes) for completion; a `min_wait_s=3.0` floor guards against the most obvious case, but this is a timing heuristic, not a grasp-success check — there's no classifier yet confirming the grasp actually succeeded (see Research Plan Progress below)
 
 ## Research Plan Progress
@@ -414,20 +480,20 @@ Status against the STEP 1–20 development order in [`docs/research_plan.md`](do
 | 3 | 3색 블록 Pick → 90° Rotate → Place | ✅ Rotate/grip-lock/release mechanism built generically (works for any tool, not block-specific) |
 | 4 | 실제 수술도구 2개 Pick | ✅ Done — Grasper + Scissors, SmolVLA, 110 episodes |
 | 5 | 수술도구 4개 | ⏭️ Skipped — went straight to 7 tools |
-| 6 | 수술도구 7개 | 🟡 Pick data done — 7 tools × 100 episodes on a fixed tray layout (`bigse0u1/xlerobot_scrub_7tool`); SmolVLA fine-tuning from `smolvla_base` on RunPod RTX 5090 in progress. Place (tray return) data also being recorded (`bigse0u1/xlerobot_scrub_7tool_place`, 567 episodes so far) |
-| 7 | 왼팔 4개 / 오른팔 3개 역할 분담 | ⬜ Not implemented (`active_arm`/`held_tool` state not yet tracked) |
-| 8 | Whisper 연결 | 🟡 Mic → canonical tool label → GUI task prompt is wired and triggers the full demo; no Tray Slot lookup or Command Parser state machine yet |
-| 9 | Fixed Tray Slot 연결 | ⬜ Not started |
-| 10 | Handle Classifier 학습 | 🟡 Data capture tool ready (분류기 tab: scan pose, per-slot ROIs, shuffled arrangements → labeled crops); data collection and training not started |
-| 11 | Visual Verification 연결 | ⬜ Not started |
+| 6 | 수술도구 7개 | ✅ Done — 7 tools × 100 episodes, fixed layout; `bigse0u1/smolvla_7tool` (fine-tuned from `smolvla_base`) grasps 117/140 = 83.6% |
+| 7 | 왼팔 4개 / 오른팔 3개 역할 분담 | ✅ Done — arm follows the actual slot (1–4 left, 5–7 right); handover opens only the holding arm's gripper |
+| 8 | Whisper 연결 | ✅ Done — faster-whisper (small, CPU) + alias parser → requested tool → Verify & Recover |
+| 9 | Fixed Tray Slot 연결 | ✅ Done — `TRAY_LAYOUT` home slots |
+| 10 | Handle Classifier 학습 | ✅ Done — ResNet18, 945/945 (100%) in arrangement-grouped 5-fold CV; with 2 training arrangements color 94% vs grayscale 68% |
+| 11 | Visual Verification 연결 | ✅ Done — tray scan + instruction remapping in the demo sequence; oracle-slot remapping picks 50/60 (83.3%) vs baseline 0/60 |
 | 12 | Pick → 90° Rotation | ✅ Done — settle-detection + grip-lock + IMU-feedback rotation |
-| 13 | D415 Hand Detection | ⬜ Not started |
-| 14 | Depth → 3D Hand Position | ⬜ Not started |
-| 15 | Vision-Guided Handover | ⬜ Not started — current handoff replays a single pre-recorded fixed pose, not hand-position-driven |
+| 13 | D415 Hand Detection | ✅ Done — MediaPipe HandLandmarker on the head RGB stream |
+| 14 | Depth → 3D Hand Position | ⏭️ Replaced by a 3×3 image grid (depth not used) |
+| 15 | Vision-Guided Handover | ✅ Done — hand cell → per-arm saved pose (top row; default 0,1), slow approach/return |
 | 16 | Return Zone | ⏭️ Future work — out of scope for ICEIC 2027 |
 | 17 | Tool Retrieval | ⏭️ Future work — out of scope for ICEIC 2027 |
 | 18 | Tray Return | ⏭️ Future work — Place data recording stopped at 567 episodes (`bigse0u1/xlerobot_scrub_7tool_place`) |
-| 19 | Wrong-Slot Disturbance Experiment | ⬜ Not started |
-| 20 | End-to-End Evaluation | ⬜ Not started |
+| 19 | Wrong-Slot Disturbance Experiment | 🟡 Baseline 0/60 and oracle remapping 50/60 done (exp. 02); full system (exp. 04) next |
+| 20 | End-to-End Evaluation | ⬜ Next (exp. 05) |
 
-**Takeaway**: the manipulation core (pick, grip-lock, rotate, scripted handoff, voice trigger, emergency stop) works end-to-end for a 2-tool case on a fixed layout, and the 7-tool Pick dataset (700 episodes) is complete with SmolVLA fine-tuning from `smolvla_base` underway. The next structural pieces — tray-slot state + handle classifier with tray scan and instruction remapping (STEP 9–11, the paper's Verify & Recover method), and real hand detection to replace the scripted handoff pose (STEP 13–15) — are what's needed to match the paper's "Proposed" method (§31, Method C) instead of today's "SmolVLA-only on a fixed layout" approximation.
+**Takeaway**: the full Task 1 pipeline now runs on the robot — voice request → tray scan with the handle classifier → instruction remapping (Verify & Recover) → SmolVLA pick → grip lock → 90° turn → hand-guided handover. Remaining work is evaluation: the integrated wrong-slot experiment (exp. 04) and end-to-end trials (exp. 05); see [`experiments/README.md`](experiments/README.md).

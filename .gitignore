@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 desktop/handoff_pose.json
 desktop/classifier_config.json
+desktop/align_reference_head.png
+desktop/handover_poses.json
+desktop/hand_landmarker.task
