@@ -885,7 +885,7 @@ class HandoverPanel(QGroupBox):
                 self.cfg.update(json.load(f))
         except (OSError, ValueError):
             pass
-        self.cell = (0, 1)
+        self.cell = (1, 1)
         self.last_hand = None      # 미리보기/진행 중 마지막 검출 결과
         self.last_hand_t = 0.0
 
@@ -906,7 +906,7 @@ class HandoverPanel(QGroupBox):
         fl.addRow("팔:", self.cb_arm)
         grid = QWidget(); gl = QVBoxLayout(grid); gl.setSpacing(2); gl.setContentsMargins(0, 0, 0, 0)
         self.cell_btns = {}
-        for r in range(1):  # 위 줄(0,*)만 사용 — 손을 내밀 수 있는 위치. 나머지 줄은 기본 칸 0,1로 전달
+        for r in range(3):  # 3×3 9칸 모두 사용
             row = QHBoxLayout(); row.setSpacing(2)
             for c in range(3):
                 b = QPushButton(f"{r},{c}"); b.setFixedHeight(28)
@@ -914,7 +914,7 @@ class HandoverPanel(QGroupBox):
                 row.addWidget(b); self.cell_btns[(r, c)] = b
             gl.addLayout(row)
         fl.addRow("칸 (화면 기준):", grid)
-        hint = QLabel("가운데·아래 줄 / 미저장 칸 / 손 미검출 → 0,1"); hint.setWordWrap(True)
+        hint = QLabel("미저장 칸 / 손 미검출 → 1,1 (없으면 가장 가까운 칸)"); hint.setWordWrap(True)
         hint.setStyleSheet("color:#8b949e;font-size:11px;")
         fl.addRow(hint)
         bb = QHBoxLayout()
@@ -961,11 +961,11 @@ class HandoverPanel(QGroupBox):
         self._move_to(self.cfg[arm][key])
         self._status(f"{arm} 팔 칸 {key} 자세로 이동 (🛑 긴급 정지로 해제)")
 
-    DEFAULT_CELL = (0, 1)
+    DEFAULT_CELL = (1, 1)
 
     def pose_for(self, arm, cell):
-        """저장된 칸이면 그 자세, 아니면(가운데·아래 줄·미저장·손 미검출 cell=None) 0,1 자세.
-        0,1도 없으면 가장 가까운 저장 칸."""
+        """저장된 칸이면 그 자세, 아니면(미저장·손 미검출 cell=None) 1,1 자세.
+        1,1도 없으면 가장 가까운 저장 칸."""
         saved = self.cfg.get(arm, {})
         if cell is not None and f"{cell[0]},{cell[1]}" in saved:
             key = f"{cell[0]},{cell[1]}"
@@ -983,7 +983,7 @@ class HandoverPanel(QGroupBox):
         self.l_head.setText(f"pan={self.cfg['head'][0]:.1f}, tilt={self.cfg['head'][1]:.1f}")
         dk = f"{self.DEFAULT_CELL[0]},{self.DEFAULT_CELL[1]}"
         miss = [a for a in ("left", "right") if dk not in self.cfg[a]]
-        self.l_info.setText(f"저장된 칸 — left {len(self.cfg['left'])}/3, right {len(self.cfg['right'])}/3 (초록 = 저장됨)"
+        self.l_info.setText(f"저장된 칸 — left {len(self.cfg['left'])}/9, right {len(self.cfg['right'])}/9 (초록 = 저장됨)"
                             + (f"\n⚠️ 기본 칸 {dk} 미저장: {', '.join(miss)}" if miss else ""))
 
     def overlay_boxes(self, w=640, h=480, target=None):
@@ -993,8 +993,7 @@ class HandoverPanel(QGroupBox):
                 x1, y1 = c * w // 3, r * h // 3
                 on = target == (r, c)
                 boxes.append({"x1": x1 + 1, "y1": y1 + 1, "x2": x1 + w // 3 - 1, "y2": y1 + h // 3 - 1,
-                              "label": f"{r},{c}" if r == 0 else "->0,1",
-                              "color": (60, 140, 255) if on else (120, 120, 120) if r == 0 else (70, 70, 70)})
+                              "label": f"{r},{c}", "color": (60, 140, 255) if on else (120, 120, 120)})
         hand = self.last_hand if time.time() - self.last_hand_t < 0.5 else None
         if hand:
             x1, y1, x2, y2 = hand["box"]
@@ -1761,8 +1760,10 @@ class MainWindow(QMainWindow):
         if ok:
             self.l_voice_status.setText(f'"{text}" → {canonical} → 데모 시퀀스 시작 '
                                         f'({self._whisper_name}, {getattr(self, "_voice_elapsed", 0):.1f}s)')
-            if self.cb_vr_method.currentIndex() == 2:  # Task 직접 입력 모드에서도 음성은 기존처럼 동작
-                self.cb_vr_method.setCurrentIndex(1)
+            if self.cb_vr_method.currentIndex() == 2:  # Task 직접 입력 모드에서 음성 요청 → Verify & Recover 사용
+                self.cb_vr_method.setCurrentIndex(0)
+            method = "Proposed" if self.cb_vr_method.currentIndex() == 0 else "Baseline (스캔 없음)"
+            self.l_voice_status.setText(self.l_voice_status.text() + f" [{method}]")
             self._request_and_run(canonical)
         else:
             self.l_voice_status.setText(f'매칭 실패: "{text}" ({self._whisper_name})')
@@ -2023,7 +2024,7 @@ class MainWindow(QMainWindow):
             self._vr_scan_then(_decide)
 
     HAND_STABLE_N = 5        # 같은 칸에서 연속 검출 횟수 (≈0.5 s)
-    HAND_TIMEOUT_S = 5.0     # 이 시간 안에 손이 확정되지 않으면 기본 칸(0,1) 자세로 전달
+    HAND_TIMEOUT_S = 5.0     # 이 시간 안에 손이 확정되지 않으면 기본 칸(1,1) 자세로 전달
 
     def _hand_guided_handoff(self, token, home_pose, arm, on_done):
         """시선 자세로 헤드 이동 → 손 검출 → 손이 있는 칸 확정 → 도구를 든 팔의 그 칸 자세로 핸드오버."""
