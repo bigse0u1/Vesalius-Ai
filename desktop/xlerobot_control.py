@@ -26,6 +26,7 @@ try:
     from lerobot.utils.constants import HF_LEROBOT_HOME
     import torch
     from lerobot.common.control_utils import predict_action
+    from lerobot.policies import prepare_observation_for_inference
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.utils.device_utils import get_safe_torch_device
@@ -49,6 +50,16 @@ TOOL_ALIASES = {
     "IRRIGATOR": ["irrigator", "이리게이터", "이리게이터", "석션"],
     "SPECIMEN_BAG": ["specimen bag", "스페시먼백", "스페시먼 백", "백", "bag", "back"]
 }
+
+# Whisper: 모델 선택지 (첫 항목이 기본값) + 도구 이름 힌트. initial_prompt에 도구 이름을 넣으면
+# 비슷한 발음을 그 단어 쪽으로 인식한다. CPU(i7-13700F) 기준 3초 음성: small 0.8s, medium 2.2s,
+# large-v3-turbo 3.5s — turbo는 인코더가 large-v3 그대로라 CPU에서는 medium보다 느리다.
+WHISPER_MODELS = ["medium", "large-v3-turbo", "small"]
+# 짧은 명령용: 타임스탬프·이전 문맥·온도 재시도 끔, 출력 길이 제한 → 잡음에서 길게 늘어지는 것 방지
+WHISPER_OPTS = dict(beam_size=5, initial_prompt=None, vad_filter=True, without_timestamps=True,
+                    condition_on_previous_text=False, temperature=0.0, max_new_tokens=24)
+WHISPER_PROMPT = ("수술 도구 요청. 그라스퍼, 바이폴라, 시저, 가위, 클리퍼, 훅, 이리게이터, 스페시먼 백. "
+                  "Grasper, bipolar, scissors, clipper, hook, irrigator, specimen bag.")
 
 # Canonical label -> tool name exactly as used in the recorded task strings
 # ("Pick up the <name>"). Must match the dataset, e.g. Clipper was recorded as "clippers".
@@ -196,6 +207,10 @@ class ControlThread(threading.Thread):
         self.device = None
         self.ai_task = ""
         self.scripted_action = None
+        # AI 실행 옵션 (둘 다 끄면 기존 동작과 동일: 1/60 s sleep, 50-step chunk를 다 쓴 뒤 동기 추론)
+        self.ai_30hz = False     # 학습 데이터 fps(30)로 action 재생
+        self.ai_smooth = False   # 다음 chunk를 미리(백그라운드) 계산하고 경계를 crossfade
+        self.reset_ai_state()
 
     def set_head(self, pan, tilt):
         with self._lock:
@@ -204,6 +219,80 @@ class ControlThread(threading.Thread):
     def set_wheels(self, x, y, theta):
         with self._lock:
             self.wx, self.wy, self.wt = x, y, theta
+
+    SMOOTH_PREFETCH = 20   # 남은 step이 이만큼이면 다음 chunk 계산 시작 (추론 ~145 ms ≈ 60Hz 9 step / 30Hz 5 step)
+    SMOOTH_BLEND = 10      # 이전 chunk 남은 부분과 새 chunk를 섞는 step 수
+
+    def reset_ai_state(self):
+        self._chunk = None
+        self._chunk_i = 0
+        self._step = 0
+        self._last_vec = None
+        self._prefetch_busy = False
+        self._prefetch_result = None  # (chunk ndarray, request step)
+
+    def _inference_obs(self, obs):
+        imgs = [_decode_b64_image(obs.get(k, "")) for k in ("head", "left_wrist", "right_wrist")]
+        if obs is None or any(i is None for i in imgs):
+            return None
+        return {
+            "observation.images.head": imgs[0],
+            "observation.images.left_wrist": imgs[1],
+            "observation.images.right_wrist": imgs[2],
+            "observation.state": np.array([obs.get(k, 0.0) or 0.0 for k in STATE_KEYS], dtype=np.float32),
+        }
+
+    def _compute_chunk(self, obs):
+        """관측 1개 → 정책의 action chunk 전체 (n, 17), 단위는 select_action 경로와 동일."""
+        io = self._inference_obs(obs)
+        if io is None:
+            return None
+        import torch
+        with torch.inference_mode():
+            b = self.preprocessor(prepare_observation_for_inference(io, self.device, self.ai_task, None))
+            ch = self.policy.predict_action_chunk(b)
+            out = self.postprocessor(ch)
+        out = out.detach().to("cpu")
+        return out.squeeze(0).numpy() if out.dim() == 3 else out.numpy()
+
+    def _prefetch(self, obs, req_step):
+        try:
+            c = self._compute_chunk(obs)
+            if c is not None:
+                self._prefetch_result = (c, req_step)
+        finally:
+            self._prefetch_busy = False
+
+    def _smooth_next_action(self):
+        """현재 chunk를 재생하면서 다음 chunk를 미리 계산 → 멈춤 없이 이어 붙임 (경계는 crossfade)."""
+        if self._chunk is None:
+            c = self._compute_chunk(self._latest_obs)
+            if c is None:
+                return None
+            self._chunk, self._chunk_i = c, 0
+        if self._prefetch_result is not None:
+            new, req = self._prefetch_result
+            self._prefetch_result = None
+            new = new[max(0, self._step - req):]      # 계산하는 동안 이미 지나간 step은 건너뜀
+            old = self._chunk[self._chunk_i:]
+            n = min(len(old), len(new), self.SMOOTH_BLEND)
+            if len(new):
+                w = (np.arange(n) + 1)[:, None] / (n + 1)
+                head = (1 - w) * old[:n] + w * new[:n] if n else new[:0]
+                self._chunk, self._chunk_i = np.concatenate([head, new[n:]]), 0
+        remaining = len(self._chunk) - self._chunk_i
+        if remaining <= self.SMOOTH_PREFETCH and not self._prefetch_busy and self._prefetch_result is None:
+            self._prefetch_busy = True
+            threading.Thread(target=self._prefetch, args=(self._latest_obs, self._step), daemon=True).start()
+        if remaining <= 0:
+            vec = self._last_vec  # 다음 chunk가 아직 없으면 마지막 자세 유지
+            if vec is None:
+                return None
+        else:
+            vec = self._chunk[self._chunk_i]; self._chunk_i += 1
+        self._step += 1
+        self._last_vec = vec
+        return {k: float(v) for k, v in zip(ACTION_KEYS, vec)}
 
     def _infer_action(self):
         obs = self._latest_obs
@@ -256,6 +345,7 @@ class ControlThread(threading.Thread):
             self.running = True
             self.signals.status_changed.emit("연결됨 ✓")
 
+            next_t = time.perf_counter()
             while self.running:
                 try:
                     try:
@@ -268,7 +358,7 @@ class ControlThread(threading.Thread):
                     if self.scripted_action is not None:
                         action = dict(self.scripted_action)
                     elif self.ai_mode and self.policy is not None:
-                        action = self._infer_action()
+                        action = self._smooth_next_action() if self.ai_smooth else self._infer_action()
                         if action is None:
                             time.sleep(1/60)
                             continue
@@ -291,7 +381,16 @@ class ControlThread(threading.Thread):
                         })
                     self.last_action = dict(action)
                     self.cmd_sock.send_string(json.dumps(action))
-                    time.sleep(1/60)
+                    if self.ai_30hz and self.ai_mode and self.policy is not None:
+                        next_t += 1 / 30  # 처리 시간과 무관하게 정확히 30 Hz
+                        d = next_t - time.perf_counter()
+                        if d > 0:
+                            time.sleep(d)
+                        else:
+                            next_t = time.perf_counter()
+                    else:
+                        time.sleep(1/60)  # 기존 동작
+                        next_t = time.perf_counter()
                 except Exception as e:
                     self.signals.status_changed.emit(f"오류: {e}")
                     time.sleep(0.1)
@@ -1243,6 +1342,8 @@ class MainWindow(QMainWindow):
         self._arm_joints = {'left': [0.0]*6, 'right': [0.0]*6}
         self._viz_counter = 0
         self.whisper_model = None
+        self._whisper_name = None
+        self._whisper_lock = threading.Lock()
         self._voice_recording = False
         self._voice_chunks = []
         self._voice_stream = None
@@ -1354,10 +1455,24 @@ class MainWindow(QMainWindow):
         self.btn_ai_mode.setStyleSheet("QPushButton{background:#1f6feb;color:white;padding:6px;border-radius:4px;}QPushButton:disabled{background:#30363d;color:#8b949e;}")
         self.btn_ai_mode.clicked.connect(self._toggle_ai_mode)
         aifl.addWidget(self.btn_ai_mode)
+        self.cb_ai_30hz = QCheckBox("30Hz (학습 속도)")
+        self.cb_ai_30hz.setToolTip("action chunk를 학습 데이터와 같은 30 fps로 재생 (끄면 기존 60 Hz 루프)")
+        self.cb_ai_smooth = QCheckBox("부드러운 연결")
+        self.cb_ai_smooth.setToolTip("다음 동작 묶음을 미리 계산해 멈칫거림 없이 이어 붙임 (끄면 기존 방식)")
+        for cb in (self.cb_ai_30hz, self.cb_ai_smooth):
+            cb.toggled.connect(self._apply_ai_opts)
+            aifl.addWidget(cb)
         self.l_ai_status = QLabel("정책 로드 안 됨")
         self.l_ai_status.setStyleSheet("color:#8b949e;font-size:11px;")
         self.l_ai_status.setWordWrap(True)
         aifl.addWidget(self.l_ai_status)
+        wh_row = QHBoxLayout()
+        wh_row.addWidget(QLabel("Whisper:"))
+        self.cb_whisper = QComboBox(); self.cb_whisper.addItems(WHISPER_MODELS)
+        self.cb_whisper.setToolTip("음성 인식 모델 (CPU, 3초 음성 기준 medium 2.2s / turbo 3.5s / small 0.8s)")
+        self.cb_whisper.currentTextChanged.connect(self._on_whisper_model_changed)
+        wh_row.addWidget(self.cb_whisper, 1)
+        aifl.addLayout(wh_row)
         self.btn_voice = QPushButton("🎤 음성 명령 듣기")
         self.btn_voice.setStyleSheet("QPushButton{background:#9e6a03;color:white;padding:6px;border-radius:4px;}")
         self.btn_voice.clicked.connect(self._toggle_voice_record)
@@ -1412,6 +1527,12 @@ class MainWindow(QMainWindow):
         self.cb_hand_guided.setToolTip("헤드 화면 9칸에서 손을 찾아 그 칸의 자세로 전달 (자세는 핸드오버 탭에서 설정)")
         self.cb_hand_guided.setChecked(True)
         dfl.addWidget(self.cb_hand_guided)
+        self.cb_decide_only = QCheckBox("판별만 (집지 않음, 실험 04)")
+        self.cb_decide_only.setToolTip("트레이 스캔 + 판단만 하고 로그에 기록. 로봇은 움직이지 않음")
+        dfl.addWidget(self.cb_decide_only)
+        self.f_vr_note = QLineEdit(); self.f_vr_note.setPlaceholderText("조건 메모 (예: A, 정상, 없음-grasper)")
+        self.f_vr_note.setToolTip("로그에 함께 저장되는 실험 조건 표시")
+        dfl.addWidget(self.f_vr_note)
         self.cb_pick_only = QCheckBox("집기까지만 (실험 04)")
         self.cb_pick_only.setToolTip("집기 + 자세 고정에서 멈춤 (회전·전달 생략). 🛑 긴급 정지로 해제")
         dfl.addWidget(self.cb_pick_only)
@@ -1580,6 +1701,7 @@ class MainWindow(QMainWindow):
             self._voice_recording = True
             self.btn_voice.setText("■ 녹음 중지 (다시 클릭)")
             self.l_voice_status.setText("듣는 중...")
+            self._ensure_whisper_async()  # 말하는 동안 모델 로드 (처음엔 다운로드)
 
             def _cb(indata, frames, time_info, status):
                 self._voice_chunks.append(indata.copy())
@@ -1603,15 +1725,33 @@ class MainWindow(QMainWindow):
                      if self._voice_chunks else np.zeros(0, dtype=np.float32))
             threading.Thread(target=self._do_transcribe, args=(audio,), daemon=True).start()
 
+    def _get_whisper(self):
+        """선택된 Whisper 모델 (필요하면 로드, 스레드 안전)."""
+        with self._whisper_lock:
+            name = self.cb_whisper.currentText()
+            if self.whisper_model is None or self._whisper_name != name:
+                self.whisper_model = WhisperModel(name, device="cpu", compute_type="int8")
+                self._whisper_name = name
+            return self.whisper_model
+
+    def _ensure_whisper_async(self):
+        if self.whisper_model is None or self._whisper_name != self.cb_whisper.currentText():
+            threading.Thread(target=self._get_whisper, daemon=True).start()
+
+    def _on_whisper_model_changed(self, name):
+        self.whisper_model = None  # 다음 녹음 때 새 모델 로드
+        self.l_voice_status.setText(f"Whisper 모델: {name} (다음 녹음 때 로드)")
+
     def _do_transcribe(self, audio):
         try:
             if audio.size < 16000 * 0.3:
                 self.signals.voice_done.emit(False, "너무 짧습니다", "")
                 return
-            if self.whisper_model is None:
-                self.whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-            segments, info = self.whisper_model.transcribe(audio, language=None, beam_size=5)
+            model = self._get_whisper()
+            t0 = time.time()
+            segments, info = model.transcribe(audio, language=None, **{**WHISPER_OPTS, "initial_prompt": WHISPER_PROMPT})
             text = "".join(seg.text for seg in segments).strip()
+            self._voice_elapsed = time.time() - t0
             canonical = _to_canonical_tool(text)
             self.signals.voice_done.emit(canonical is not None, text, canonical or "")
         except Exception as e:
@@ -1619,12 +1759,13 @@ class MainWindow(QMainWindow):
 
     def _on_voice_done(self, ok, text, canonical):
         if ok:
-            self.l_voice_status.setText(f'"{text}" → {canonical} → 데모 시퀀스 시작')
+            self.l_voice_status.setText(f'"{text}" → {canonical} → 데모 시퀀스 시작 '
+                                        f'({self._whisper_name}, {getattr(self, "_voice_elapsed", 0):.1f}s)')
             if self.cb_vr_method.currentIndex() == 2:  # Task 직접 입력 모드에서도 음성은 기존처럼 동작
                 self.cb_vr_method.setCurrentIndex(1)
             self._request_and_run(canonical)
         else:
-            self.l_voice_status.setText(f'매칭 실패: "{text}"')
+            self.l_voice_status.setText(f'매칭 실패: "{text}" ({self._whisper_name})')
 
     def _start_auto_rotate(self):
         if not self.ctrl or not self.ctrl.running:
@@ -1848,12 +1989,17 @@ class MainWindow(QMainWindow):
             self._start_demo_sequence(); return
         self.cb_vr_tool.setCurrentText(requested)
         method = "proposed" if mode == 0 else "baseline"
-        base = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "method": method, "requested": requested}
+        decide_only = self.cb_decide_only.isChecked()
+        base = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "method": method, "requested": requested,
+                "decide_only": decide_only, "note": self.f_vr_note.text().strip()}
 
         def _decide(preds):
             d = verify_and_recover(requested, preds, method, self.VR_CONF_THR)
             self._vr_log({**base, "preds": preds, **d})
             if d["instruction"] is None:
+                if decide_only:
+                    self._vr_count = getattr(self, "_vr_count", 0) + 1
+                    self.statusBar().showMessage(f"판별 기록됨 ({self._vr_count}회째): {requested} → {d['status']}")
                 self.l_vr_result.setText(self.l_vr_result.text() + f"\n⚠️ 중단: {d['reason']}")
                 self.l_demo_status.setText(f"⚠️ {d['reason']} — 의사에게 알림")
                 self.statusBar().showMessage(f"Verify & Recover 중단: {d['reason']}")
@@ -1864,6 +2010,10 @@ class MainWindow(QMainWindow):
                                          f"\n{d['status']}: {d['reason']}\n→ \"{d['instruction']}\" ({d['arm']})")
             else:
                 self.l_vr_result.setText(f"baseline → \"{d['instruction']}\"")
+            if decide_only:
+                self._vr_count = getattr(self, "_vr_count", 0) + 1
+                self.statusBar().showMessage(f"판별 기록됨 ({self._vr_count}회째): {requested} → {d['status']} slot {d['slot']}")
+                return
             self.f_ai_task.setText(d["instruction"])
             self._start_demo_sequence()
 
@@ -2031,6 +2181,11 @@ class MainWindow(QMainWindow):
         self.head_pan = max(-100, min(100, pan))
         self.head_tilt = max(-100, min(100, tilt))
 
+    def _apply_ai_opts(self, *_):
+        if self.ctrl:
+            self.ctrl.ai_30hz = self.cb_ai_30hz.isChecked()
+            self.ctrl.ai_smooth = self.cb_ai_smooth.isChecked()
+
     def _toggle_ai_mode(self):
         if not self.ctrl or not self.ctrl.running:
             self.statusBar().showMessage("먼저 로봇에 연결하세요")
@@ -2040,6 +2195,8 @@ class MainWindow(QMainWindow):
             # clear it so a restart doesn't replay the previous run's leftover chunk
             # (stale motions from the old pose / old task) before re-inferring.
             self.policy.reset()
+            self.ctrl.reset_ai_state()
+            self._apply_ai_opts()
             self.ctrl.policy = self.policy
             self.ctrl.preprocessor = self.preprocessor
             self.ctrl.postprocessor = self.postprocessor

@@ -5,11 +5,15 @@ Press ENTER, speak the tool name, press ENTER again to stop recording.
 Ctrl+C to quit.
 """
 import sys
+import time
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
 SAMPLE_RATE = 16000
+# 도구 이름 힌트 (GUI의 WHISPER_PROMPT와 같게 유지)
+PROMPT = ("수술 도구 요청. 그라스퍼, 바이폴라, 시저, 가위, 클리퍼, 훅, 이리게이터, 스페시먼 백. "
+          "Grasper, bipolar, scissors, clipper, hook, irrigator, specimen bag.")
 
 # Canonical label -> phrases that should map to it (lowercased substring match)
 TOOL_ALIASES = {
@@ -50,7 +54,7 @@ def record_until_enter() -> np.ndarray:
 
 
 def main():
-    model_size = sys.argv[1] if len(sys.argv) > 1 else "small"
+    model_size = sys.argv[1] if len(sys.argv) > 1 else "medium"
     print(f"Whisper 모델 로드 중 ({model_size})...")
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
     print("준비 완료.\n")
@@ -65,13 +69,18 @@ def main():
             print("너무 짧습니다. 다시 시도하세요.\n")
             continue
 
-        segments, info = model.transcribe(audio, language=None, beam_size=5)
+        t0 = time.time()
+        segments, info = model.transcribe(audio, language=None, beam_size=5, initial_prompt=PROMPT,
+                                          vad_filter=True, without_timestamps=True,
+                                          condition_on_previous_text=False, temperature=0.0, max_new_tokens=24)
         text = "".join(seg.text for seg in segments).strip()
+        elapsed = time.time() - t0
         canonical = to_canonical(text)
 
         print(f"  인식된 언어: {info.language} (확률 {info.language_probability:.2f})")
         print(f"  인식된 텍스트: \"{text}\"")
         print(f"  매칭된 도구: {canonical if canonical else '❌ 매칭 실패'}")
+        print(f"  인식 시간: {elapsed:.2f}s ({model_size})")
         print()
 
 
