@@ -301,7 +301,7 @@ Figure 계획: [`docs/figures_plan.md`](figures_plan.md) (메인 Figure 1장).
 | 항목 | 위치 |
 |---|---|
 | Pick 데이터셋 | `bigse0u1/xlerobot_scrub_7tool` (Hugging Face) |
-| 정책 | `bigse0u1/smolvla_7tool` (Hugging Face), 학습 명령은 README "Training" |
+| 정책 | `bigse0u1/smolvla_7tool` (Hugging Face), 학습 명령은 [`setup.md`](setup.md) "Training" |
 | 분류기 데이터·모델 | `~/xlerobot_classifier_data` (crops, labels.jsonl, models/) |
 | 분류기 학습 | `python classifier/train_classifier.py` |
 | GUI (V&R, 핸드오버, 수집 도구) | `desktop/xlerobot_control.py` |

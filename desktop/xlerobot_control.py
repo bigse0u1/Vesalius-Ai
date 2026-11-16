@@ -1384,8 +1384,8 @@ class MainWindow(QMainWindow):
         self.f_ip    = QLineEdit("192.168.0.34")
         self.f_cmd   = QLineEdit("5555")
         self.f_obs   = QLineEdit("5556")
-        self.f_lport = QLineEdit("/dev/ttyACM0")
-        self.f_rport = QLineEdit("/dev/ttyACM1")
+        self.f_lport = QLineEdit("/dev/ttyACM1")
+        self.f_rport = QLineEdit("/dev/ttyACM0")
         self.f_tid   = QLineEdit("xlerobot_leader")
         for lbl, w in [("Jetson IP",self.f_ip),("CMD 포트",self.f_cmd),
                         ("OBS 포트",self.f_obs),("왼쪽 리더암",self.f_lport),
