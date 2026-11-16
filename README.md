@@ -4,6 +4,12 @@
 
 Target venue: ICEIC 2027 · Y-MAS 베살리우스 팀
 
+## Demo
+
+[![Demo video](https://img.youtube.com/vi/sg-hl-Vl0sA/hqdefault.jpg)](https://www.youtube.com/watch?v=sg-hl-Vl0sA)
+
+*Click to watch on YouTube.*
+
 ---
 
 ## Abstract
